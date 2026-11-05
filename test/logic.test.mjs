@@ -1,0 +1,320 @@
+// 실행: node test/logic.test.mjs   (의존성 없음 — vendor 의 SheetJS · pdf.js 만 씀)
+// 2차(2026-10-28): 수강생이 보낸 「자주 검사 CHECK SHEET」 의 칸 배치만 본뜬 가상 샘플(scripts/make-samples.py)로 검사합니다.
+// 실제 검사표 그림 · 값은 리포에 두지 않습니다.
+import assert from 'node:assert/strict';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const require = createRequire(import.meta.url);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const L = require('../js/logic.js');
+const SM = require('../js/sample-data.js');
+const Pdfs = require('../js/sample-pdfs.js');
+const XLSX = require('../vendor/xlsx.full.min.js');
+const E = require('../js/ai-endpoint.js');
+// pdf.js 를 node 에서 — 그림 그리기용 canvas 가 없다는 경고는 글자 층 읽기와 관계없어 잠시 끕니다
+const cw = console.warn, cl = console.log; console.warn = () => {}; console.log = () => {};
+const pdfjs = require('../vendor/pdfjs/pdf.min.js'); console.warn = cw; console.log = cl;
+pdfjs.GlobalWorkerOptions.workerSrc = path.join(ROOT, 'vendor/pdfjs/pdf.worker.min.js');
+
+let passed = 0;
+async function test(name, fn) {
+  try { await fn(); passed++; console.log('  ok  ' + name); }
+  catch (e) { console.error('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+}
+const aoaOf = (file) => {
+  const wb = XLSX.read(readFileSync(path.join(ROOT, 'samples', file)), { type: 'buffer', cellDates: true });
+  return XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: null });
+};
+async function textOf(name) {
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(Buffer.from(Pdfs[name], 'base64')), isEvalSupported: false, verbosity: 0 }).promise;
+  const pg = await doc.getPage(1), vp = pg.getViewport({ scale: 1 }), tc = await pg.getTextContent();
+  return L.normTextItems(tc.items, vp.height);
+}
+const S0 = L.cleanSettings({});
+const num = (lower, upper) => ({ kind: 'num', lower, upper, unit: '' });
+const verdictOf = (spec, raw, s) => L.judgeItem(spec, raw, s || S0).status;
+// 샘플 파일을 앱과 같은 모양으로
+const sampleFiles = () => SM.files.map(f => ({ id: L.fileId(f.name, f.size), name: f.name, size: f.size, text: f.kind === 'text' }));
+const readingOf = (name) => { const t = JSON.parse(JSON.stringify(SM.truth[name])); return { meta: t.meta, items: t.items, hogis: t.hogis, problems: t.problems, done: true, by: '시험', at: '2026-10-28 09:00' }; };
+const readingsFor = (kinds) => { const o = {}; SM.files.forEach(f => { if (kinds.includes(f.kind)) o[L.fileId(f.name, f.size)] = readingOf(f.name); }); return o; };
+
+console.log('규격 글자 읽기');
+await test('대칭 공차 — 420±1 · 2740 ± 6 mm · 85+/-2 · 앞의 항목 이름 · 지름 기호, 단위는 기억만', () => {
+  const a = L.parseSpecString('420±1');
+  assert.deepEqual([a.ok, a.lower, a.upper, a.nominal, a.unit], [true, 419, 421, 420, '']);
+  const b = L.parseSpecString('길이 2740 ± 6 mm');
+  assert.deepEqual([b.lower, b.upper, b.unit], [2734, 2746, 'mm']);
+  assert.deepEqual([L.parseSpecString('85+/-2').lower, L.parseSpecString('85 +- 2').upper], [83, 87]);
+  assert.deepEqual([L.parseSpecString('Φ12.5±0.1').lower, L.parseSpecString('Φ12.5±0.1').upper], [12.4, 12.6]);
+  assert.deepEqual([L.parseSpecString('73,5±2').lower], [71.5]);              // 쉼표 소수점
+});
+await test('비대칭 공차 · MAX · MIN · 범위 — 48 +1.0/-0.5 · 12(-0.2, +0) · 1.5 MAX · MAX 0.03 · MIN 40 · 40 이상 · 8.00~8.10', () => {
+  const pick = (s) => { const r = L.parseSpecString(s); return [r.ok, r.lower, r.upper]; };
+  assert.deepEqual(pick('48 +1.0/-0.5'), [true, 47.5, 49]);
+  assert.deepEqual(pick('48 -0.5/+1.0'), [true, 47.5, 49]);
+  assert.deepEqual(pick('12(+0/-0.2)'), [true, 11.8, 12]);
+  assert.deepEqual(pick('평탄도 1.5 MAX'), [true, null, 1.5]);
+  assert.deepEqual(pick('MAX 0.03'), [true, null, 0.03]);
+  assert.deepEqual(pick('최대 2'), [true, null, 2]);
+  assert.deepEqual(pick('MIN 40'), [true, 40, null]);
+  assert.deepEqual(pick('40 이상'), [true, 40, null]);
+  assert.deepEqual(pick('8.00~8.10'), [true, 8, 8.1]);
+  assert.deepEqual(pick('8.10 ~ 8.00 mm'), [true, 8, 8.1]);
+});
+await test('규격이 아닌 글자는 읽지 않음 — 「가이드 홀 방향」 · 「외 관」 · 빈 칸', () => {
+  ['가이드 홀 방향(전·후) 확인할 것', '외 관', '', 'Drum Slot Hole'].forEach(s => assert.equal(L.parseSpecString(s).ok, false, s));
+});
+
+console.log('판정');
+await test('경계값 포함(10장 ④) — 420±1 이면 419 · 421 합격, 418.99 · 421.01 불합격 · 「미포함」 설정이면 421 불합격', () => {
+  const sp = L.resolveSpec({ no: '2', label: '420±1', kind: 'num' }, 'P', []);
+  assert.equal(verdictOf(sp, '419'), 'pass');
+  assert.equal(verdictOf(sp, '421'), 'pass');
+  assert.equal(verdictOf(sp, '420'), 'pass');
+  assert.equal(verdictOf(sp, '418.99'), 'fail');
+  assert.equal(verdictOf(sp, '421.01'), 'fail');
+  assert.equal(L.judgeItem(sp, '421.01', S0).side, 'high');
+  assert.equal(verdictOf(sp, '421', L.cleanSettings({ inclusive: false })), 'fail');
+  // 소수 오차 — 0.1 + 0.2 처럼 만들어진 기준도 경계값은 합격
+  assert.equal(verdictOf(num(0.1 + 0.2, 0.7), '0.3'), 'pass');
+});
+await test('비대칭 · MAX · MIN 경계 — 47.5 · 49 합격, 49.3 불합격 · 1.5 합격, 1.51 불합격 · 40 합격, 39.9 불합격', () => {
+  const asym = L.resolveSpec({ label: '48 +1.0/-0.5' }, '', []), mx = L.resolveSpec({ label: '1.5 MAX' }, '', []), mn = L.resolveSpec({ label: 'MIN 40' }, '', []);
+  assert.deepEqual(['47.5', '49', '49.3', '47.4'].map(v => verdictOf(asym, v)), ['pass', 'pass', 'fail', 'fail']);
+  assert.deepEqual(['1.5', '1.51', '0'].map(v => verdictOf(mx, v)), ['pass', 'fail', 'pass']);
+  assert.deepEqual(['40', '39.9', '1000'].map(v => verdictOf(mn, v)), ['pass', 'fail', 'pass']);
+});
+await test('값 읽기 — 단위를 붙여도 · 쉼표 소수점 · 육안 OK/NG/○/× · 체크(V · ✓) · 빈 칸 · 「?」 · 규격 없음', () => {
+  const sp = num(419, 421), eye = { kind: 'okng' };
+  assert.equal(verdictOf(sp, '420.5mm'), 'pass');
+  assert.equal(verdictOf(sp, '420,5'), 'pass');
+  assert.equal(verdictOf(num(0.4, 0.6), '0.5cm'), 'pass');                     // 기준 단위가 없으면 숫자끼리(단위는 따지지 않음)
+  assert.deepEqual(['OK', '○', 'NG', '×', '', '?'].map(v => verdictOf(eye, v)), ['pass', 'pass', 'fail', 'fail', 'blank', 'unread']);
+  assert.equal(verdictOf(sp, 'V'), 'pass');
+  assert.equal(verdictOf(sp, '✓', L.cleanSettings({ checkAs: 'hold' })), 'unread');
+  assert.equal(verdictOf(sp, 'NG'), 'fail');                                   // 수치 칸에 NG 를 적으면 불합격
+  assert.equal(verdictOf(sp, '42?.3'), 'unread');
+  assert.equal(verdictOf(num(null, null), '12'), 'nospec');
+});
+await test('호기 판정 — LH/RH 줄이 따로, 한 줄이라도 벗어나면 그 호기 불합격(빈 칸이 함께 있어도) · 칸 이름 「2-rh」 도 읽음', () => {
+  const items = [{ no: '1', label: '방향 확인', tool: '육안' }, { no: '2', label: '420±1', tool: '줄자', subs: ['LH', 'RH'] }, { no: '3', label: '85±2', subs: ['LH', 'RH'] }];
+  const u = (values, done = true) => L.judgeUnit({ items, values, meta: { part: 'P' }, done }, [], S0);
+  const ok = u({ '1': 'OK', '2 LH': '420.2', '2 RH': '419.8', '3 LH': '85', '3 RH': '86' });
+  assert.equal(ok.verdict, 'pass'); assert.equal(ok.cells.length, 5);
+  const rh = u({ '1': 'OK', '2 LH': '420.2', '2-rh': '421.4', '3 LH': '85', '3 RH': '86' });
+  assert.equal(rh.verdict, 'fail'); assert.deepEqual(rh.fails.map(x => x.key), ['2 RH']);
+  assert.equal(u({ '1': 'OK', '2 LH': '420.2', '2 RH': '', '3 LH': '89', '3 RH': '86' }).verdict, 'fail');
+  assert.equal(u({ '1': 'OK', '2 LH': '420.2', '2 RH': '', '3 LH': '85', '3 RH': '86' }).verdict, 'hold');
+  assert.equal(L.judgeUnit({ items, values: { '1': 'OK', '2 LH': '420.2', '2 RH': '', '3 LH': '85', '3 RH': '86' }, meta: {}, done: true }, [], L.cleanSettings({ blankAs: 'ignore' })).verdict, 'pass');
+  assert.equal(u({ '1': 'NG', '2 LH': '420', '2 RH': '420', '3 LH': '85', '3 RH': '85' }).verdict, 'fail');
+  assert.equal(u({}, false).verdict, 'wait');                                 // 판독 끝나지 않았으면 판정하지 않음
+});
+await test('스펙 덮어쓰기 표가 검사표 글자보다 먼저 — 품번 + 항목 이름 또는 No', () => {
+  const it = { no: '2', label: '420±1' };
+  assert.equal(L.resolveSpec(it, 'QA-1', [{ part: 'QA-1', item: '420±1', lower: 419.5, upper: 420.5 }]).upper, 420.5);
+  assert.equal(L.resolveSpec(it, 'QA-1', [{ part: 'QA-1', item: '2', lower: 400, upper: 440 }]).lower, 400);
+  assert.equal(L.resolveSpec(it, 'QA-1', [{ part: 'QA-9', item: '2', lower: 400, upper: 440 }]).src, 'sheet');   // 다른 품번은 무시
+  const ov = L.parseSpec([['품번', '검사 항목', '기준값', '공차'], ['QA-1', '420±1', 420, 0.5], [null, '외관', null, null]]);
+  assert.deepEqual([ov.rows[0].lower, ov.rows[0].upper], [419.5, 420.5]);
+  assert.equal(ov.warnings.length, 1);                                        // 외관 — 기준이 없음(판정 방식을 적으라고 알림)
+});
+
+console.log('검사표 글자 층');
+await test('글자 층 샘플 4장 — 머리 칸 · 항목(규격 · 측정기 · LH/RH) · 호기 열 · 값 · 문제점을 정답대로 읽음', async () => {
+  const texts = SM.files.filter(f => f.kind === 'text');
+  assert.equal(texts.length, 4);
+  for (const f of texts) {
+    const r = L.parseSheetText(await textOf(f.name)), t = SM.truth[f.name];
+    assert.ok(r.ok, f.name + ' ' + r.reason);
+    assert.equal(r.template, 'self-check');
+    assert.deepEqual(r.meta, t.meta, f.name + ' 머리 칸');
+    assert.deepEqual(r.items.map(i => [i.no, i.label.replace(/\s+/g, ''), i.tool, i.subs]), t.items.map(i => [i.no, i.label.replace(/\s+/g, ''), i.tool, i.subs]), f.name + ' 항목');
+    assert.deepEqual(r.hogis.map(x => x.no), t.hogis.map(x => x.no), f.name + ' 호기');
+    t.hogis.forEach((th, i) => {
+      const want = Object.fromEntries(Object.entries(th.values).filter(([, v]) => v !== ''));
+      assert.deepEqual(r.hogis[i].values, want, f.name + ' 호기 ' + th.no + ' 값');
+    });
+    assert.deepEqual(r.problems, t.problems, f.name + ' 문제점');
+    assert.deepEqual(r.warnings, []);
+    assert.deepEqual(r.items.map(i => i.kind), t.items.map(i => (i.tool === '육안' ? 'okng' : 'num')));
+  }
+});
+await test('스캔 샘플 2장 — 글자 층이 없어 「notext」, PDF 안에 호기 번호가 글자로 없음(사람 · AI 판독 대상)', async () => {
+  const scans = SM.files.filter(f => f.kind === 'scan');
+  assert.equal(scans.length, 2);
+  for (const f of scans) {
+    const items = await textOf(f.name);
+    assert.equal(items.length, 0, f.name);
+    assert.equal(L.parseSheetText(items).reason, 'notext');
+    const raw = Buffer.from(Pdfs[f.name], 'base64').toString('latin1');
+    assert.ok(!raw.includes(SM.truth[f.name].hogis[0].no));
+  }
+});
+await test('표 왼쪽 도면 글자(LH · RH · 치수)와 검사자 줄(서명 · 이름)은 값으로 읽지 않음', () => {
+  const T = [
+    ['자주 검사 CHECK SHEET', 40, 40], ['모델명', 40, 100], ['MODEL-Z9', 120, 100], ['품번', 260, 100], ['ZZ-1', 320, 100],
+    ['No.', 430, 230], ['검사 항목', 470, 230], ['측정기', 540, 236], ['호기수', 590, 224], ['901', 610, 230], ['902', 646, 230], ['문제점', 780, 226],
+    ['1', 438, 270], ['420±1', 478, 270], ['줄자', 545, 270], ['LH', 580, 262], ['RH', 580, 280], ['420.1', 605, 262], ['421.5', 641, 280], ['419.9', 605, 280],
+    ['LH', 200, 270], ['RH', 200, 280], ['(2) 420', 300, 262],                                   // 도면 글자(표 왼쪽)
+    ['2', 438, 305], ['외 관', 478, 305], ['육안', 545, 305], ['OK', 608, 305], ['NG', 644, 305], ['찍힘', 785, 305],
+    ['검사자', 470, 320], ['홍길동', 605, 320], ['김철수', 641, 320]                                // 서명 줄(마지막 줄 바로 아래)
+  ].map(([s, x, y]) => ({ s, x, y, w: s.length * 5, h: 8, cx: x + s.length * 2.5 }));
+  const r = L.parseSheetText(T);
+  assert.ok(r.ok);
+  assert.deepEqual(r.meta, { model: 'MODEL-Z9', part: 'ZZ-1' });
+  assert.deepEqual(r.items.map(i => [i.no, i.label, i.subs.join('/'), i.kind]), [['1', '420±1', 'LH/RH', 'num'], ['2', '외 관', '', 'okng']]);
+  assert.deepEqual(r.hogis, [{ no: '901', values: { '1 LH': '420.1', '1 RH': '419.9', '2': 'OK' } }, { no: '902', values: { '1 RH': '421.5', '2': 'NG' } }]);
+  assert.deepEqual(r.problems, { '2': '찍힘' });
+  assert.ok(!JSON.stringify(r).includes('홍길동'));
+});
+
+console.log('식별(모델 · 품번 · 호기)');
+const known = L.knownIds(SM.ships, {});
+await test('파일 이름은 약한 힌트 — 「모델-호기」 · 「img00001」 · 「모델 상부 #호기」 · 「모델 하부센터 (날짜)」 · 「날짜~날짜 작업」', () => {
+  const g = (n) => { const x = L.hintFromName(n, known); return [x.model, x.part, x.hogi]; };
+  assert.deepEqual(g('MODEL-A100-314501.pdf'), ['MODEL-A100', '', '314501']);
+  assert.deepEqual(g('img00001.pdf'), ['', '', '']);
+  assert.deepEqual(g('MODEL-A100 상부 #314504.pdf'), ['MODEL-A100', '', '314504']);
+  assert.deepEqual(g('MODEL-B200 하부센터 (2026.10.12).pdf'), ['MODEL-B200', '', '']);   // 날짜 숫자를 호기로 읽지 않음
+  assert.deepEqual(g('1013~1015 작업.pdf'), ['', '', '']);
+  assert.deepEqual(g('QA-80022_315011.pdf'), ['', 'QA-80022', '315011']);
+  assert.deepEqual(g('MODEL-A100 20261015.pdf'), ['MODEL-A100', '', '']);            // 모르는 숫자(날짜)는 # 이 없으면 호기 아님
+});
+await test('검사표 내용이 파일 이름보다 먼저 — 이름이 다른 모델 · 호기를 가리켜도 내용으로 식별, 내용이 없으면 「파일 이름으로만」 · 「식별 안 됨」', () => {
+  const files = [{ id: 'a', name: 'MODEL-B200-315012.pdf' }, { id: 'b', name: 'MODEL-A100 상부 #314504.pdf' }, { id: 'c', name: 'img00009.pdf' }];
+  const readings = { a: { meta: { model: 'MODEL-A100 / MODEL-A100E', part: 'QA-70011' }, items: [], hogis: [{ no: '314501', values: {} }], done: true } };
+  const b = L.buildUnits(files, readings, known);
+  assert.deepEqual(b.ids.map(i => i.status), ['ok', 'hint', 'unknown']);
+  assert.deepEqual([b.units[0].meta.part, b.units[0].meta.model, b.units[0].hogi], ['QA-70011', 'MODEL-A100 / MODEL-A100E', '314501']);
+  assert.equal(b.ids[0].src.model, 'content');
+  assert.deepEqual([b.ids[1].src.model, b.ids[1].hogiSrc, b.units[1].hogi, b.units[1].done], ['filename', 'filename', '314504', false]);
+  assert.deepEqual(b.ids[2].missing, ['품번 · 모델', '호기']);
+  assert.equal(b.units.length, 2);
+});
+
+console.log('출하일정');
+await test('출하일정 샘플 엑셀 — 제목 줄 아래 머리행 · 엑셀 날짜 · 숫자 호기 · 호기 범위 펼침 · 품번 빈 줄은 모델로', () => {
+  const r = L.parseShip(aoaOf('출하일정_샘플.xlsx'));
+  assert.equal(r.det.headerRow, 2);
+  assert.deepEqual(r.rows.map(x => { const o = Object.assign({}, x); delete o.row; return o; }), SM.ships);
+  assert.equal(r.rows.length, 13);
+  assert.deepEqual(r.rows.slice(-2).map(x => [x.hogi, x.qty]), [['315015', 1], ['315016', 1]]);
+  assert.deepEqual(r.warnings, []);
+});
+await test('호기 칸 나누기 — 범위 · 쉼표 · 숫자 · # · 「호기」 꼬리 · 100대 넘는 범위는 펼치지 않음', () => {
+  assert.deepEqual(L.splitHogi('314498~314500'), ['314498', '314499', '314500']);
+  assert.deepEqual(L.splitHogi('A-0098~A-0101'), ['A-0098', 'A-0099', 'A-0100', 'A-0101']);
+  assert.deepEqual(L.splitHogi('314498, 314502 / #314510'), ['314498', '314502', '314510']);
+  assert.deepEqual(L.splitHogi(314498), ['314498']);
+  assert.deepEqual(L.splitHogi('314498호기'), ['314498']);
+  assert.deepEqual(L.splitHogi('1~500'), ['1~500']);
+  assert.deepEqual(L.splitHogi(''), []);
+});
+await test('출하 대조(샘플, 글자 층만 읽은 상태) — 검사표 없음 5 · 불합격 1 · 미판정 2(대기 1 · 보류 1) · 합격 5 · 출하일정에 없는 검사 1', () => {
+  const an = L.analyze(SM.ships, sampleFiles(), readingsFor(['text']), [], S0, SM.refDate);
+  const c = an.counts;
+  assert.deepEqual([c.ships, c.none, c.fail, c.wait, c.hold, c.pass, c.extra, c.unknown, c.hint], [13, 5, 1, 1, 1, 5, 1, 1, 1]);
+  const st = Object.fromEntries(an.rows.map(r => [r.ship.hogi, r.status]));
+  assert.deepEqual([st['315010'], st['315012'], st['315013'], st['314503'], st['314504'], st['314505']], ['fail', 'pass', 'hold', 'pass', 'wait', 'none']);
+  assert.deepEqual(an.fails.map(x => [x.hogi, x.no + ' ' + x.sub, x.raw, x.problem]), [['315010', '3 LH', '49.3', '재가공 후 재측정']]);
+  assert.equal(an.extra[0].hogi, '314499');
+  // 출하일 순 · 남은 날
+  const none = L.shipList(an, ['none']);
+  assert.deepEqual(none.map(r => [r.ship.hogi, L.dday(r.days)]), [['314505', 'D-5'], ['314506', 'D-6'], ['315014', 'D-7'], ['315015', 'D-8'], ['315016', 'D-8']]);
+  assert.match(an.rows.find(r => r.ship.hogi === '314504').notes.join(), /파일 이름으로만/);
+});
+await test('스캔 2장까지 판독하면 — 품번 없는 출하 줄은 모델+호기로 짝지어 외관 NG 불합격, 상한과 같은 421 은 합격', () => {
+  const an = L.analyze(SM.ships, sampleFiles(), readingsFor(['text', 'scan']), [], S0, SM.refDate);
+  const c = an.counts;
+  assert.deepEqual([c.none, c.fail, c.wait, c.hold, c.pass, c.unknown, c.hint], [4, 2, 0, 1, 6, 0, 0]);
+  const r505 = an.rows.find(r => r.ship.hogi === '314505');
+  assert.deepEqual([r505.status, r505.how], ['fail', 'model']);
+  assert.equal(an.rows.find(r => r.ship.hogi === '314504').status, 'pass');
+});
+await test('짝 짓기 규칙 — 품번+호기가 먼저, 품번이 다르면 모델+호기로 짝짓고 알림, 같은 호기 검사표가 둘이면 나중에 판독한 것', () => {
+  const unit = (id, part, model, hogi, v, at) => ({ id, name: id + '.pdf' });
+  const files = [unit('x'), unit('y'), unit('z')];
+  const items = [{ no: '1', label: '10±1' }];
+  const rd = (part, model, hogi, v, at) => ({ meta: { part, model }, items, hogis: [{ no: hogi, values: { '1': v } }], done: true, at });
+  const readings = { x: rd('P-1', 'M-1', '100', '10', '2026-10-01 10:00'), y: rd('P-OLD', 'M-2', '200', '10', '2026-10-01 10:00'), z: rd('P-1', 'M-1', '100', '12', '2026-10-02 10:00') };
+  const ships = [{ date: '2026-10-05', part: 'P-1', model: 'M-1', hogi: '100' }, { date: '2026-10-06', part: 'P-2', model: 'M-2', hogi: '200' }, { date: '2026-10-07', part: '', model: 'M-1', hogi: '999' }];
+  const an = L.analyze(ships, files, readings, [], S0, '2026-10-04');
+  assert.deepEqual(an.rows.map(r => [r.status, r.how]), [['fail', 'part'], ['pass', 'model'], ['none', '']]);
+  assert.match(an.rows[0].notes.join(), /같은 호기 검사표 2개/);
+  assert.match(an.rows[1].notes.join(), /모델\+호기/);
+});
+
+console.log('AI 반자동 판독');
+await test('판독 프롬프트 — 칸 이름(No + 구분)과 규격만, 회사 정보 없음, 서명은 읽지 말라고 함, 모르는 양식이면 항목도 읽어 달라고 함', () => {
+  const t = SM.truth['MODEL-A100 상부 #314504.pdf'];
+  const p = L.buildSheetPrompt(t.items);
+  assert.match(p, /"2 LH"/); assert.match(p, /"5 RE"/); assert.match(p, /420±1/); assert.match(p, /서명은 읽지도 적지도 마/);
+  assert.ok(!p.includes('QA-70011') && !p.includes('MODEL-A100'));
+  assert.match(L.buildSheetPrompt([]), /"항목"/);
+});
+await test('AI 답 읽기 — 코드 묶음 · 끝 쉼표 · 「2-lh」 같은 칸 이름 · 모르는 칸 · 머리 칸 · 문제점 · 확신 낮음 · 항목까지 읽어 온 답', () => {
+  const t = SM.truth['1013~1015 작업.pdf'];
+  const ans = '```json\n{"모델명":"MODEL-A100","품번":"QA-70011","작성일":"2026.10.15","호기":[{"호기":"#314505","값":{"1":"OK","2-lh":"420.5","2 RH":"419.7","9 XX":"1",}}],"문제점":{"6":"찍힘"},"확신낮음":["2 lh"],}\n```';
+  const p = L.parseSheetAi(ans, t.items);
+  assert.ok(p.ok, p.error);
+  assert.deepEqual(p.meta, { model: 'MODEL-A100', part: 'QA-70011', date: '2026-10-15' });
+  assert.deepEqual(p.hogis, [{ no: '314505', values: { '1': 'OK', '2 LH': '420.5', '2 RH': '419.7' } }]);
+  assert.deepEqual(p.unknown, ['9 XX']); assert.deepEqual(p.problems, { '6': '찍힘' }); assert.deepEqual(p.lowConf, ['2 LH']);
+  const q = L.parseSheetAi(JSON.stringify({ 항목: [{ No: '1', 검사항목: '30±1', 구분: ['LH', 'RH'] }], 호기: [{ 호기: '7', 값: { '1 LH': '30.2', '1 RH': '31.5' } }] }), []);
+  assert.deepEqual([q.items.length, q.items[0].subs, q.hogis[0].values['1 RH']], [1, ['LH', 'RH'], '31.5']);
+  assert.equal(L.parseSheetAi('답이 없습니다', []).ok, false);
+});
+await test('요약 프롬프트 — 품번 · 모델을 별칭으로 가리고, 답의 별칭을 원래 이름으로 되돌림', () => {
+  const an = L.analyze(SM.ships, sampleFiles(), readingsFor(['text']), [], S0, SM.refDate);
+  const b = L.buildSummaryPrompt(an, { mask: true });
+  assert.ok(!/QA-\d|MODEL-[AB]/.test(b.text), b.text.match(/QA-\d+|MODEL-\w+/));
+  assert.match(b.text, /제품1/); assert.match(b.text, /7일 안에 출하/);
+  assert.equal(L.unmask('제품1 확인', b.map), Object.keys(b.map).find(k => b.map[k] === '제품1') + ' 확인');
+  assert.match(L.buildSummaryPrompt(an, { mask: false }).text, /QA-80022/);
+});
+await test('그림을 함께 보내는 요청 — 이미지 칸이 든 messages 를 그대로 보냄', () => {
+  const msgs = [{ role: 'user', content: [{ type: 'text', text: '읽어줘' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] }];
+  const req = E.buildChatRequest({ baseUrl: 'https://api.openai.com/v1/', model: 'm', apiKey: 'k' }, msgs, { maxTokens: 800 });
+  const body = JSON.parse(req.init.body);
+  assert.equal(req.url, 'https://api.openai.com/v1/chat/completions');
+  assert.equal(body.messages[0].content[1].image_url.url.slice(0, 10), 'data:image');
+  assert.equal(E.STORE_KEY, 'data10-13.ai');
+});
+
+console.log('샘플 · 저장 · 리포');
+await test('샘플 PDF 6장 — base64 가 PDF 이고 크기 · 내용이 samples/ 파일과 같음', () => {
+  assert.equal(SM.files.length, 6);
+  SM.files.forEach(f => {
+    const b = Buffer.from(Pdfs[f.name], 'base64');
+    assert.equal(b.slice(0, 5).toString(), '%PDF-', f.name);
+    assert.equal(b.length, f.size, f.name);
+    assert.deepEqual(readFileSync(path.join(ROOT, 'samples/공유폴더_샘플', f.name)), b, f.name);
+  });
+});
+await test('저장 데이터 되살리기 — 1단계(v1) 자료는 legacy 로 비우고, 2차는 이상한 값만 버림 · 기준일 유지', () => {
+  const v1 = L.restoreDb({ plan: [{ part: 'A' }], files: [{ id: '1', name: 'a.pdf' }] });
+  assert.equal(v1.legacy, true); assert.equal(v1.files.length, 0);
+  const d = L.restoreDb({ v: 2, ships: [{ part: 'A', hogi: '1' }, { part: 'B' }, null], files: [{ id: '1', name: 'a.pdf' }, { name: 'x' }], settings: { nearPct: 99, checkAs: 'hold' }, masks: [{ x: 0.1, y: 0.1, w: 0.2, h: 0.1 }, { x: 'a' }], refDate: '2026.10.28' });
+  assert.deepEqual([d.ships.length, d.files.length, d.masks.length, d.settings.nearPct, d.settings.checkAs, d.refDate], [1, 1, 1, 10, 'hold', '2026-10-28']);
+  assert.deepEqual(L.restoreDb('x'), L.emptyDb());
+});
+await test('리포에 회사 · 지명 낱말과 첨부 검사표의 실제 모델 · 품번 · 관리 번호가 없음(js · 문서 · 스크립트 · 샘플 PDF 글자 층)', async () => {
+  // 낱말을 리포에 그대로 두지 않으려고 글자 번호로 적습니다
+  const banned = [[0xac74, 0xd654], [0xcc3d, 0xc6d0], [0xd604, 0xb300], [0xb450, 0xc0b0], [0xd55c, 0xc6b8], [0x45, 0x43, 0x37, 0x35, 0x30], [0x31, 0x34, 0x37, 0x30, 0x37, 0x31, 0x33, 0x34], [0x4b, 0x48, 0x51, 0x2d]].map(a => String.fromCharCode(...a));
+  const files = [];
+  (function walk(d) { for (const n of readdirSync(d)) { if (['.git', 'vendor', 'node_modules'].includes(n)) continue; const p = path.join(d, n); if (statSync(p).isDirectory()) walk(p); else if (/\.(js|mjs|md|py|html|css|json)$/.test(n)) files.push(p); } })(ROOT);
+  let txt = files.map(p => readFileSync(p, 'utf8')).join('\n');
+  for (const f of SM.files.filter(x => x.kind === 'text')) txt += (await textOf(f.name)).map(t => t.s).join(' ');
+  banned.forEach(w => assert.ok(!txt.includes(w), '낱말 ' + w.length + '글자'));
+});
+
+const { versions } = await import('../scripts/bump-version.mjs');
+await test('판 맞추기 — index.html ?v= · logic.js · app.js 가 같은 판 (scripts/bump-version.mjs)', () => {
+  const v = versions();
+  assert.equal(v.logic, L.VERSION, 'logic.js VERSION'); assert.equal(v.app, L.VERSION, 'app.js APP_VERSION');
+  assert.ok(v.html.length >= 8 && v.html.every(x => x === L.VERSION), 'index.html 의 모든 js·css 에 ?v=' + L.VERSION + ' — ' + JSON.stringify(v.html));
+});
+
+console.log('\n' + passed + '개 통과' + (process.exitCode ? ' — 실패 있음' : ''));
