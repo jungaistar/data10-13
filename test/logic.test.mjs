@@ -422,7 +422,12 @@ await test('리포에 회사 · 지명 낱말과 첨부 검사표의 실제 모�
   const banned = [[0xac74, 0xd654], [0xcc3d, 0xc6d0], [0xd604, 0xb300], [0xb450, 0xc0b0], [0xd55c, 0xc6b8], [0x45, 0x43, 0x37, 0x35, 0x30], [0x31, 0x34, 0x37, 0x30, 0x37, 0x31, 0x33, 0x34], [0x4b, 0x48, 0x51, 0x2d]].map(a => String.fromCharCode(...a));
   const files = [];
   (function walk(d) { for (const n of readdirSync(d)) { if (['.git', 'vendor', 'node_modules'].includes(n)) continue; const p = path.join(d, n); if (statSync(p).isDirectory()) walk(p); else if (/\.(js|mjs|md|py|html|css|json)$/.test(n)) files.push(p); } })(ROOT);
-  let txt = files.map(p => readFileSync(p, 'utf8')).join('\n');
+  // 회사 이름은 2026-11-10 애본님 지시로 홈페이지 머리글에 일부러 넣는다(js/auth-config.js · docs/plan.json 의 landing) — 그 두 곳만 빼고 본다
+  let txt = files.filter(p => !p.endsWith(path.join('js', 'auth-config.js'))).map(p => {
+    const t = readFileSync(p, 'utf8');
+    if (p.endsWith(path.join('docs', 'plan.json'))) { const j = JSON.parse(t); delete j.landing; return JSON.stringify(j); }
+    return t;
+  }).join('\n');
   for (const f of SM.files.filter(x => x.kind === 'text')) txt += (await textOf(f.name)).map(t => t.s).join(' ');
   banned.forEach(w => assert.ok(!txt.includes(w), '낱말 ' + w.length + '글자'));
 });
