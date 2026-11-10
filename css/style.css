@@ -401,3 +401,12 @@ table.list.sheet-grid tfoot th, table.list.sheet-grid tfoot td { background: #ee
 .ref-date { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
 .ref-date .field input { min-height: 40px; }
 pre.prompt { white-space: pre-wrap; background: #fafbfd; border: 1px solid var(--line); border-radius: 10px; padding: 10px; overflow-wrap: anywhere; }
+
+/* 2026-11-10 — 쪽 방향 · 가릴 영역 범위 · 수동 판독 · 보류 빈 칸 */
+.rot-bar { align-items: center; margin: 0 0 10px; gap: 6px; }
+.rot-bar .note { margin-right: 4px; }
+.mask-help .field { margin: 0; max-width: 420px; }
+.mask-help select { max-width: 100%; }
+.mask .mask-x { position: absolute; right: -11px; top: -11px; width: 24px; height: 24px; min-height: 0; padding: 0; border-radius: 50%; border: 1px solid #b3261e; background: #fff; color: #b3261e; font-weight: 700; line-height: 1; cursor: pointer; }
+.manual-bar .btn-row { margin: 0; }
+table.list.sheet-grid td.v.empty input { border-color: #e0b44a; background: #fffbef; }

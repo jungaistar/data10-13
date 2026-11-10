@@ -7,7 +7,7 @@
   var L = window.QCLogic, S = window.QCStore, SM = window.QCSample, E = window.AIEndpoint, AIP = window.AIPanel, XLSX = window.XLSX;
   /* 판 맞추기 — 브라우저가 옛 logic.js 와 새 app.js 를 섞어 쓰면(Pages 캐시) 버튼과 결과가 어긋날 수 있어, 섞였으면 계산하지 않고 새로고침을 안내합니다.
      판은 scripts/bump-version.mjs 로 index.html(?v=) · logic.js 와 함께 올립니다. */
-  var APP_VERSION = '2026-10-28.1';
+  var APP_VERSION = '2026-11-10.1';
   if (!L || L.VERSION !== APP_VERSION) {
     var m0 = document.getElementById('main') || document.body;
     m0.innerHTML = '<section class="card" id="versionMismatch"><h1>새 판이 나왔습니다 — 새로고침(Ctrl+F5)해 주세요</h1><p class="alert warn">이 브라우저가 옛 파일과 새 파일을 섞어 불러왔습니다(js/logic.js ' +
@@ -17,7 +17,7 @@
   }
   (function () { var ft = document.querySelector('.site-footer .inner') || document.querySelector('.site-footer'); if (!ft) return; var s = document.createElement('span'); s.className = 'ver'; s.textContent = ' · 판 ' + APP_VERSION; ft.appendChild(s); })();
   var db = S.loadDb();
-  var ui = { cur: '', page: 1, zoom: 'fit', fileFilter: 'todo', drawMask: false, aiText: '', aiFor: '', lowConf: [], pendShip: null, pendSpec: null, busy: '' };
+  var ui = { cur: '', page: 1, zoom: 'fit', fileFilter: 'todo', drawMask: false, maskScope: 'sheet', focus: '', aiText: '', aiFor: '', lowConf: [], pendShip: null, pendSpec: null, busy: '' };
   var main = document.getElementById('main');
 
   /* ── 작은 도구 ───────────────────────────── */
@@ -91,7 +91,12 @@
   function analysis() { return L.analyze(db.ships, db.files, db.readings, db.overrides, db.settings, refDate()); }
   function fileById(id) { return db.files.filter(function (f) { return f.id === id; })[0] || null; }
   function ddayCell(n) { return h('span', { class: 'dd' + (n != null && n < 0 ? ' past' : n != null && n <= 3 ? ' soon' : '') }, L.dday(n)); }
-  function readLink(fid, text) { return h('a', { class: 'btn btn-sm', href: '#/read', onclick: function () { ui.cur = fid; ui.page = 1; ui.aiText = ''; ui.lowConf = []; } }, text || '판독'); }
+  /* 판독 화면으로 — 파일과 쪽(검사표)을 골라 엽니다. manual 이면 바로 칸에 적을 수 있게 첫 빈 칸으로 */
+  function readLink(fid, page, text, manual) {
+    return h('a', { class: 'btn btn-sm', href: '#/read', onclick: function () { ui.cur = fid; ui.page = page || 1; ui.aiText = ''; ui.lowConf = []; ui.focus = manual ? L.sheetKey(fid, page || 1) : ''; } }, text || '판독');
+  }
+  function sheetName(f, page) { return L.sheetLabel(f, page || 1); }
+  function rotOf(f, n) { return L.normRot((f.rot || {})[n]); }
   function emptyNotice(what) {
     return h('section', { class: 'card empty' },
       h('p', null, what || '아직 넣은 자료가 없습니다.'),
@@ -140,11 +145,13 @@
   }
   /* 쪽 그림 — width 픽셀 폭 */
   function pageCanvas(f, n, width) {
-    var k = f.id + '#' + n + '@' + width;
+    var turn = rotOf(f, n);
+    var k = f.id + '#' + n + '@' + width + 'r' + turn;
     if (canvasCache[k]) return canvasCache[k];
     canvasCache[k] = openDoc(f).then(function (pdf) {
       return pdf.getPage(Math.min(n, pdf.numPages)).then(function (page) {
-        var vp0 = page.getViewport({ scale: 1 }), vp = page.getViewport({ scale: width / vp0.width });
+        var rotation = ((page.rotate || 0) + turn) % 360;   // 돌린 방향(쪽마다 저장) — AI 에 보낼 그림도 이 방향
+        var vp0 = page.getViewport({ scale: 1, rotation: rotation }), vp = page.getViewport({ scale: width / vp0.width, rotation: rotation });
         var c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
         var g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
         return page.render({ canvasContext: g, viewport: vp }).promise.then(function () { c.dataset.pages = pdf.numPages; return c; });
@@ -153,37 +160,57 @@
     canvasCache[k].catch(function () { delete canvasCache[k]; });
     return canvasCache[k];
   }
-  /* AI 에 보낼 그림 — 가릴 영역을 흰색으로 덮은 JPEG */
-  function maskedImage(f, n) {
+  /* 이 검사표(쪽)에 쓰는 가릴 영역 — 파일(쪽)별 > 공정별 > 모든 검사표 */
+  function procOf(sk) { var r = db.readings[sk]; return r && r.meta ? r.meta.process || '' : ''; }
+  function masksOf(sk, proc) { return L.masksFor(db, sk, proc == null ? procOf(sk) : proc); }
+  /* AI 에 보낼 그림 — 가릴 영역을 흰색으로 덮은 JPEG(돌린 방향 그대로) */
+  function maskedImage(f, n, proc) {
+    var ms = masksOf(L.sheetKey(f.id, n), proc).masks;
     return pageCanvas(f, n, 1600).then(function (src) {
       var c = document.createElement('canvas'); c.width = src.width; c.height = src.height;
       var g = c.getContext('2d'); g.drawImage(src, 0, 0);
       g.fillStyle = '#fff';
-      (db.masks || []).forEach(function (m) { g.fillRect(m.x * c.width, m.y * c.height, m.w * c.width, m.h * c.height); });
+      ms.forEach(function (m) { g.fillRect(m.x * c.width, m.y * c.height, m.w * c.width, m.h * c.height); });
       return c;
     });
   }
-  /* 글자 층 읽기 — 1쪽의 글자 조각을 자리(x·y)와 함께 꺼내 양식 칸으로 읽습니다. 글자 층이 없으면(스캔 그림) f.text = false */
+  /* 글자 층 읽기 — 쪽마다 글자 조각을 자리(x·y)와 함께 꺼내 양식 칸으로 읽습니다(한 PDF 에 여러 쪽 · 여러 공정 — 2026-11-10 답 ④).
+     글자가 누워 있으면(90° · 180°) 그 방향으로 돌려 읽고 화면도 그 방향으로 세웁니다. 스캔 그림은 글자가 없어 방향을 알 수 없으니 화면에서 돌립니다.
+     f.pageText[쪽] = true(글자 층으로 읽음) · false(그림만) · 'partial'(글자는 있으나 양식이 다름). f.text 는 1쪽 값(2차 자료와 같음). */
+  function readPage(f, pdf, n, force) {
+    return pdf.getPage(n).then(function (page) {
+      return page.getTextContent().then(function (tc) {
+        var items = tc.items, turn = L.textRotation(items), norm;
+        if (turn) { var vpr = page.getViewport({ scale: 1, rotation: turn }); norm = L.normTextItems(L.viewportTextItems(items, vpr.transform, vpr.height), vpr.height); }
+        else norm = L.normTextItems(items, page.getViewport({ scale: 1 }).height);
+        var r = L.parseSheetText(norm), sk = L.sheetKey(f.id, n);
+        f.pageText = f.pageText || {};
+        if (norm.length >= 8) {
+          var extra = L.normRot(turn - (page.rotate || 0));
+          if (extra && (!f.rot || f.rot[n] == null)) { (f.rot = f.rot || {})[n] = extra; (f.rotAuto = f.rotAuto || {})[n] = true; }
+        }
+        if (r.ok && r.items.length) {
+          f.pageText[n] = true;
+          if (force || !db.readings[sk]) db.readings[sk] = { meta: r.meta, items: r.items, hogis: r.hogis, problems: r.problems, auto: 'text', warnings: r.warnings, done: true, by: '글자 층 자동', at: nowText() };
+        } else f.pageText[n] = r.reason === 'notext' ? false : 'partial';
+        return r;
+      });
+    });
+  }
   function autoRead(f) {
     return openDoc(f).then(function (pdf) {
-      return pdf.getPage(1).then(function (page) {
-        var vp = page.getViewport({ scale: 1 });
-        return page.getTextContent().then(function (tc) {
-          var r = L.parseSheetText(L.normTextItems(tc.items, vp.height));
-          f.pages = pdf.numPages;
-          if (r.ok && r.items.length) {
-            f.text = true;
-            if (!db.readings[f.id]) db.readings[f.id] = { meta: r.meta, items: r.items, hogis: r.hogis, problems: r.problems, auto: 'text', warnings: r.warnings, done: true, by: '글자 층 자동', at: nowText() };
-          } else f.text = r.reason === 'notext' ? false : 'partial';
-          return r;
-        });
-      });
+      f.pages = pdf.numPages;
+      var seq = Promise.resolve();
+      for (var n = 1; n <= pdf.numPages; n++) (function (n) { seq = seq.then(function () { return readPage(f, pdf, n); }); })(n);
+      return seq.then(function () { f.text = f.pageText[1]; });
     }).catch(function () { f.text = null; return null; });
   }
   function autoReadAll(list) {
-    var n = { text: 0, image: 0 };
+    var n = { text: 0, image: 0, pages: 0 };
     ui.busy = '검사표 PDF 의 글자 층을 읽는 중…'; render();
-    return list.reduce(function (p, f) { return p.then(function () { return autoRead(f).then(function () { if (f.text === true) n.text++; else n.image++; }); }); }, Promise.resolve())
+    return list.reduce(function (p, f) { return p.then(function () { return autoRead(f).then(function () {
+      for (var k = 1; k <= L.pagesOf(f); k++) { n.pages++; if ((f.pageText || {})[k] === true) n.text++; else n.image++; }
+    }); }); }, Promise.resolve())
       .then(function () { ui.busy = ''; save(); render(); return n; });
   }
 
@@ -193,14 +220,15 @@
     var d = L.emptyDb();
     d.ships = SM.ships.map(function (s) { return Object.assign({}, s); });
     d.shipFile = SM.shipFile;
-    d.files = SM.files.map(function (f) { return { id: L.fileId(f.name, f.size), name: f.name, size: f.size, at: '샘플', sample: true, hasPdf: true }; });
+    d.files = SM.files.map(function (f) { return { id: L.fileId(f.name, f.size), name: f.name, size: f.size, at: '샘플', sample: true, hasPdf: true, pages: f.pages ? f.pages.length : 1 }; });
     d.masks = SM.masks.map(function (m) { return Object.assign({}, m); });
+    d.maskProcs = clone(SM.maskProcs || {});
     d.refDate = SM.refDate;
     d.sample = true;
     db = d; ui.cur = ''; ui.aiText = ''; ui.lowConf = [];
     S.clearPdf(); resetCaches(); save();
     if (location.hash !== '#/ship') location.hash = '#/ship';
-    autoReadAll(db.files).then(function (n) { toast('가상 샘플 — 출하 ' + db.ships.length + '대 · 검사표 ' + db.files.length + '장(글자 층 ' + n.text + ' · 그림만 ' + n.image + ').'); });
+    autoReadAll(db.files).then(function (n) { toast('가상 샘플 — 출하 ' + db.ships.length + '대 · 검사표 PDF ' + db.files.length + '개 ' + n.pages + '쪽(글자 층 ' + n.text + ' · 그림만 ' + n.image + ').'); });
   }
 
   /* ── 자료 넣기 ───────────────────────────── */
@@ -234,7 +262,7 @@
   }
   function parsePending(p) {
     var sh = p.sheets.filter(function (s) { return s.name === p.sheet; })[0];
-    p.result = p.kind === 'ship' ? L.parseShip(sh.aoa, p.override) : L.parseSpec(sh.aoa, p.override);
+    p.result = p.kind === 'ship' ? L.parseShip(sh.aoa, p.override, { year: +refDate().slice(0, 4) }) : L.parseSpec(sh.aoa, p.override);
   }
   function startFresh() { db = L.emptyDb(); db.cleared = true; S.clearPdf(); resetCaches(); }
   function pendingCard(p) {
@@ -262,10 +290,18 @@
       h('div', { class: 'btn-row', style: 'margin-top:12px' },
         h('button', { type: 'button', class: 'btn btn-primary', disabled: !ok, onclick: function () {
           if (db.sample) { if (!confirm('지금은 가상 샘플입니다. 샘플을 모두 지우고 이 엑셀로 시작할까요?')) return; var keepA = ui.pendShip, keepB = ui.pendSpec; startFresh(); ui.pendShip = keepA; ui.pendSpec = keepB; }
-          if (p.kind === 'ship') { db.ships = p.result.rows.map(function (r) { var o = Object.assign({}, r); delete o.row; return o; }); db.shipFile = p.file; ui.pendShip = null; }
+          if (p.kind === 'ship') { db.ships = p.result.rows.map(function (r) { var o = Object.assign({}, r); delete o.row; o.file = p.file; return o; }); db.shipFile = p.file; ui.pendShip = null; }
           else { db.overrides = p.result.rows.map(function (r) { var o = Object.assign({}, r); delete o.error; return o; }); db.overrideFile = p.file; ui.pendSpec = null; }
           save(); toast('반영했습니다.'); render();
         } }, '이 내용으로 바꾸기'),
+        // 출하일정은 소형 · 초대형 · 버켓처럼 파일이 나뉘어 있습니다(2026-11-10 답 ③) — 지금 출하일정에 더하기
+        p.kind === 'ship' && db.ships.length && !db.sample ? h('button', { type: 'button', class: 'btn', disabled: !ok, onclick: function () {
+          var add0 = p.result.rows.map(function (r) { var o = Object.assign({}, r); delete o.row; o.file = p.file; return o; });
+          var before = db.ships.length;
+          db.ships = L.mergeShips(db.ships, add0);
+          db.shipFile = (db.shipFile ? db.shipFile + ' + ' : '') + p.file; ui.pendShip = null;
+          save(); toast('출하일정에 더했습니다 — ' + before + '대 → ' + db.ships.length + '대(같은 모델 · 호기는 새 파일 것으로).'); render();
+        } }, '지금 출하일정에 더하기') : null,
         h('button', { type: 'button', class: 'btn', onclick: function () { if (p.kind === 'ship') ui.pendShip = null; else ui.pendSpec = null; render(); } }, '취소')));
   }
   function addPdfs(list) {
@@ -288,10 +324,18 @@
       save();
       return autoReadAll(added);
     }).then(function (n) {
-      toast('PDF ' + added.length + '개를 넣었습니다 — 글자 층에서 읽음 ' + n.text + ' · 그림만(사람 · AI 판독) ' + n.image + (dup ? ' · 이미 있는 ' + dup + '개는 건너뜀' : '') + (all.length - files.length ? ' · PDF 아닌 파일 ' + (all.length - files.length) + '개 건너뜀' : '') + '.');
+      toast('PDF ' + added.length + '개(' + n.pages + '쪽)를 넣었습니다 — 글자 층에서 읽음 ' + n.text + '쪽 · 그림만(사람 · AI 판독) ' + n.image + '쪽' + (dup ? ' · 이미 있는 ' + dup + '개는 건너뜀' : '') + (all.length - files.length ? ' · PDF 아닌 파일 ' + (all.length - files.length) + '개 건너뜀' : '') + '.');
     }, function (e) { ui.busy = ''; toast('PDF 를 넣지 못했습니다: ' + e.message, true); render(); });
   }
-  function kindLabel(f) { return f.text === true ? '글자 층' : f.text === false ? '그림만(스캔)' : f.text === 'partial' ? '글자 층(양식 다름)' : '확인 전'; }
+  function kindLabel(f, page) {
+    var t = f.pageText && f.pageText[page || 1] !== undefined ? f.pageText[page || 1] : f.text;
+    return t === true ? '글자 층' : t === false ? '그림만(스캔)' : t === 'partial' ? '글자 층(양식 다름)' : '확인 전';
+  }
+  function removeFile(f) {
+    db.files = db.files.filter(function (x) { return x !== f; });
+    for (var k = 1; k <= L.pagesOf(f); k++) { var sk = L.sheetKey(f.id, k); delete db.readings[sk]; if (db.maskSheets) delete db.maskSheets[sk]; }
+    S.delPdf(f.id); save(); render();
+  }
   function pageImport() {
     var an = analysis(), c = an.counts;
     var shipIn = h('input', { type: 'file', accept: '.xlsx,.xls,.csv' }); shipIn.addEventListener('change', function () { if (shipIn.files[0]) loadTable('ship', shipIn.files[0]); shipIn.value = ''; });
@@ -303,18 +347,18 @@
     drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
     drop.addEventListener('drop', function (e) { e.preventDefault(); drop.classList.remove('over'); addPdfs(e.dataTransfer.files); });
     function done(ok, text) { return ok ? h('span', { class: 'done' }, text) : null; }
-    var idOf = {};
-    an.ids.forEach(function (i) { idOf[i.file.id] = i; });
+    var idOf = {}, rank = { unknown: 0, hint: 1, ok: 2 };
+    an.ids.forEach(function (i) { var o = idOf[i.file.id]; if (!o) { idOf[i.file.id] = { status: i.status, parts: [], hogis: [] }; o = idOf[i.file.id]; } if (rank[i.status] < rank[o.status]) o.status = i.status; var pm = i.meta.part || i.meta.model; if (pm && o.parts.indexOf(pm) < 0) o.parts.push(pm); i.hogis.forEach(function (x) { if (o.hogis.indexOf(x) < 0) o.hogis.push(x); }); });
     return [
       pageHead('자료 넣기', '출하일정 · 검사표 PDF', '출하일정과 공유폴더의 검사표를 넣으면, 검사표 내용으로 모델 · 품번 · 호기를 찾아 출하 예정 호기와 짝짓고(①) 합불을 판정합니다(③). 파일은 이 브라우저 안에서만 읽습니다.',
         h('div', { class: 'btn-row' }, h('button', { type: 'button', class: 'btn btn-primary', onclick: loadSample }, '샘플로 시작'))),
       h('div', { class: 'steps-row', style: 'margin-bottom:20px' },
         h('section', { class: 'step-card' }, h('h3', null, '1. 출하일정 엑셀', done(db.ships.length, db.ships.length + '대')),
-          h('p', { class: 'note' }, '「언제 · 어떤 모델/품번 · 몇 호기를 내보내는지」를 읽습니다. 열: 출하일 · 모델 · 품번 · 호기 · 수량(이름이 조금 달라도 찾고, 못 찾으면 골라 연결). 「314498~314500」 처럼 적힌 호기는 펼칩니다.'),
+          h('p', { class: 'note' }, '「언제 · 어떤 모델/품번 · 몇 호기를 내보내는지」를 읽습니다. 열: 출하일(출하예정) · 모델 · 품번 · 호기 · 수량(이름이 조금 달라도 찾고, 못 찾으면 골라 연결). 「314498~314500」 처럼 적힌 호기는 펼치고, 「8/10」 처럼 연도가 없으면 기준일의 연도로 봅니다. 소형 · 초대형 등 파일이 여러 개면 하나씩 「더하기」로 합칩니다.'),
           db.shipFile ? h('p', { class: 'note' }, '지금: ' + db.shipFile) : null,
           h('label', { class: 'btn' }, shipIn, '엑셀 고르기')),
         h('section', { class: 'step-card' }, h('h3', null, '2. 검사표 PDF', done(db.files.length, db.files.length + '장')),
-          h('p', { class: 'note' }, '파일 이름은 따지지 않습니다. 글자 층이 있는 PDF 는 칸 자리로 바로 읽고, 스캔 그림은 ② 판독에서 그림을 보며 옮기거나 AI 로 읽습니다.'),
+          h('p', { class: 'note' }, '파일 이름은 따지지 않습니다. 한 PDF 에 여러 쪽(호기 · 공정)이 있으면 쪽마다 검사표 한 장으로 봅니다. 글자 층이 있는 쪽은 칸 자리로 바로 읽고, 스캔 그림은 ② 판독에서 그림을 보며 옮기거나 AI 로 읽습니다.'),
           h('a', { class: 'btn', href: '#/ship' }, '① 출하 대조로')),
         h('section', { class: 'step-card' }, h('h3', null, '3. 스펙 덮어쓰기 표 (선택)', done(db.overrides.length, db.overrides.length + '줄')),
           h('p', { class: 'note' }, '규격은 검사표의 「420±1」 같은 글자에서 바로 읽습니다. 검사표 글자와 다른 기준을 쓰고 싶을 때만 품번 · 검사 항목(또는 No) · 하한 · 상한 표를 넣습니다.'),
@@ -324,12 +368,12 @@
       ui.pendSpec ? pendingCard(ui.pendSpec) : null,
       h('section', { class: 'card' }, h('h2', null, '검사표 PDF 넣기'), drop,
         db.files.length ? h('details', { style: 'margin-top:8px', open: db.files.length <= 12 }, h('summary', null, '넣은 파일 ' + db.files.length + '개'),
-          table(['파일', '종류', '식별', '모델 · 품번 · 호기', ''], db.files.map(function (f) {
+          table(['파일', '쪽', '종류', '식별', '모델 · 품번 · 호기', ''], db.files.map(function (f) {
             var i = idOf[f.id] || {};
-            return [f.name, kindLabel(f), st(i.status === 'ok' ? 'pass' : i.status === 'hint' ? 'hold' : 'wait', ID_LABEL[i.status] || '-'),
-              [i.meta && (i.meta.part || i.meta.model), (i.hogis || []).join(', ')].filter(Boolean).join(' · ') || '-',
-              h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { db.files = db.files.filter(function (x) { return x !== f; }); delete db.readings[f.id]; S.delPdf(f.id); save(); render(); } }, '빼기')];
-          }))) : null),
+            return [f.name, L.pagesOf(f), kindLabel(f), st(i.status === 'ok' ? 'pass' : i.status === 'hint' ? 'hold' : 'wait', ID_LABEL[i.status] || '-'),
+              [(i.parts || []).join(', '), (i.hogis || []).join(', ')].filter(Boolean).join(' · ') || '-',
+              h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { removeFile(f); } }, '빼기')];
+          }), { nw: [1] })) : null),
       db.ships.length || db.files.length ? h('section', { class: 'card' }, h('h2', null, '지금 상태'),
         h('p', null, '출하 ' + c.ships + '대 → 합격 ' + c.pass + ' · 불합격 ' + c.fail + ' · 미판정 ' + c.undecided + ' · 검사표 없음 ' + c.none + ' · 식별 필요 파일 ' + (c.unknown + c.hint)),
         h('div', { class: 'btn-row' }, h('a', { class: 'btn btn-primary', href: '#/ship' }, '① 출하 대조'), h('a', { class: 'btn', href: '#/read' }, '② 판독'), h('a', { class: 'btn', href: '#/result' }, '③ 검사 결과'))) : null
@@ -339,8 +383,9 @@
   /* ── ① 출하 대조 ─────────────────────────── */
   function shipCells(r, extra) {
     var u = r.unit;
+    var undecided = r.status === 'wait' || r.status === 'hold';
     return [r.ship.date || '-', ddayCell(r.days), r.ship.model || '', r.ship.part || '', h('b', null, r.ship.hogi)].concat(extra || [])
-      .concat([u ? u.file.name : '-', u && u.file.hasPdf !== false ? readLink(u.fileId, r.status === 'wait' ? '판독' : '보기') : '']);
+      .concat([u ? sheetName(u.file, u.page) : '-', u && u.file.hasPdf !== false ? readLink(u.fileId, u.page, undecided ? '수동 판독' : '보기', undecided) : '']);
   }
   function failText(j) { return j.fails.map(function (x) { return 'No ' + x.key + ' ' + x.raw; }).join(', '); }
   function holdText(r) {
@@ -383,13 +428,13 @@
         }), { nw: [0, 1, 4] }) : h('p', { class: 'note' }, '판독 대기 · 보류인 출하 예정 호기가 없습니다.')),
       h('section', { class: 'card' }, h('h2', null, '식별이 필요한 검사표 (' + idNeed.length + ')'),
         h('p', { class: 'note' }, '파일 이름에 규칙이 없어 모델 · 품번 · 호기는 검사표 내용에서 찾습니다. 그림만 있는 스캔은 ② 판독에서 머리 칸과 호기를 적어 주세요. 「파일 이름으로만」 은 이름에서 짐작한 것이라 검사표와 대조가 필요합니다.'),
-        idNeed.length ? table(['파일', '종류', '상태', '짐작한 것', '모자란 것', ''], idNeed.map(function (i) {
+        idNeed.length ? table(['검사표', '종류', '상태', '짐작한 것', '모자란 것', ''], idNeed.map(function (i) {
           var g = [i.meta.model, i.meta.part, i.hogis.join(', ')].filter(Boolean).join(' · ');
-          return [i.file.name, kindLabel(i.file), st(i.status === 'hint' ? 'hold' : 'wait', ID_LABEL[i.status]), g || '-', i.missing.join(', ') || (i.status === 'hint' ? '검사표로 확인' : ''), i.file.hasPdf !== false ? readLink(i.file.id, '판독 · 태그') : ''];
+          return [sheetName(i.file, i.page), kindLabel(i.file, i.page), st(i.status === 'hint' ? 'hold' : 'wait', ID_LABEL[i.status]), g || '-', i.missing.join(', ') || (i.status === 'hint' ? '검사표로 확인' : ''), i.file.hasPdf !== false ? readLink(i.file.id, i.page, '수동 판독 · 태그', true) : ''];
         })) : h('p', { class: 'note' }, '모든 검사표의 모델/품번 · 호기를 찾았습니다.')),
       an.extra.length ? h('section', { class: 'card' }, h('h2', null, '출하일정에 없는 검사 (' + an.extra.length + ')'),
         h('p', { class: 'note' }, '검사표는 있으나 출하일정에 같은 품번(모델) · 호기가 없습니다. 출하일정 기간 밖이거나 호기를 잘못 적었을 수 있습니다.'),
-        table(['작성일', '모델', '품번', '호기', '판정', '검사표', ''], an.extra.map(function (u) { return [u.meta.date || '-', u.meta.model || '', u.meta.part || '', u.hogi, st(u.judge.verdict), u.file.name, readLink(u.fileId, '보기')]; }), { nw: [0, 3] })) : null,
+        table(['작성일', '모델', '품번', '공정', '호기', '판정', '검사표', ''], an.extra.map(function (u) { return [u.meta.date || '-', u.meta.model || '', u.meta.part || '', u.meta.process || '', u.hogi, st(u.judge.verdict), sheetName(u.file, u.page), readLink(u.fileId, u.page, '보기')]; }), { nw: [0, 4] })) : null,
       db.ships.length ? h('details', { class: 'block' }, h('summary', null, '출하일정 전체 ' + an.rows.length + '대'),
         table(withU.concat(['상태', '알림', '검사표', '']), an.rows.slice().sort(function (a, b) { return (a.ship.date || '') < (b.ship.date || '') ? -1 : 1; }).map(function (r) {
           return { cls: r.status === 'fail' ? 'row-fail' : r.status === 'none' ? 'row-missing' : null, cells: shipCells(r, [st(r.status), r.notes.join(' · ')]) };
@@ -398,86 +443,141 @@
   }
 
   /* ── ② 판독 ─────────────────────────────── */
-  function idInfoMap(an) { var m = {}; an.ids.forEach(function (i) { m[i.file.id] = i; }); return m; }
-  function fileVerdict(an, fid) {
-    var us = an.units.filter(function (u) { return u.fileId === fid; });
-    if (!us.length || !us[0].done) return 'wait';
+  function idInfoMap(an) { var m = {}; an.ids.forEach(function (i) { m[i.key] = i; }); return m; }
+  /* 검사표(쪽) 하나의 판정 — 호기를 못 찾았거나 판독 전이면 'wait' */
+  function sheetVerdict(an, sk) {
+    var us = an.units.filter(function (u) { return u.sheet === sk; });
+    if (!us.length || us.some(function (u) { return !u.done; })) return 'wait';
     if (us.some(function (u) { return u.judge.verdict === 'fail'; })) return 'fail';
     if (us.some(function (u) { return u.judge.verdict === 'hold'; })) return 'hold';
     return 'pass';
   }
+  /* 파일 전체 — 쪽 가운데 하나라도 판독 대기면 대기, 아니면 불합격 > 보류 > 합격 */
+  function fileVerdict(an, fid) {
+    var f = fileById(fid), vs = f ? L.sheetPages(f).map(function (pg) { return sheetVerdict(an, L.sheetKey(fid, pg)); }) : ['wait'];
+    return ['wait', 'fail', 'hold'].filter(function (v) { return vs.indexOf(v) >= 0; })[0] || 'pass';
+  }
+  function sheetTodo(an, ids, f, pg) { var sk = L.sheetKey(f.id, pg), v = sheetVerdict(an, sk), i = ids[sk]; return v === 'wait' || v === 'hold' || (i && i.status !== 'ok'); }
   function pageRead() {
     var head0 = pageHead('②', '판독 — 검사표 보며 값 옮기기');
     var withPdf = db.files.filter(function (f) { return f.hasPdf !== false; });
     if (!withPdf.length) return [head0, emptyNotice('아직 넣은 검사표 PDF 가 없습니다.')];
     var an = analysis(), ids = idInfoMap(an);
-    function todo(f) { var i = ids[f.id], v = fileVerdict(an, f.id); return v === 'wait' || v === 'hold' || (i && i.status !== 'ok'); }
+    function todo(f) { return L.sheetPages(f).some(function (pg) { return sheetTodo(an, ids, f, pg); }); }
     var list = withPdf.filter(function (f) {
       if (ui.fileFilter === 'todo') return todo(f);
-      if (ui.fileFilter === 'fail') return fileVerdict(an, f.id) === 'fail';
+      if (ui.fileFilter === 'fail') return L.sheetPages(f).some(function (pg) { return sheetVerdict(an, L.sheetKey(f.id, pg)) === 'fail'; });
       return true;
     });
     list = list.map(function (x, i) { return [x, fileVerdict(an, x.id) === 'wait' ? 0 : 1, i]; }).sort(function (a, b) { return a[1] - b[1] || a[2] - b[2]; }).map(function (x) { return x[0]; });
-    if (!ui.cur || !fileById(ui.cur)) ui.cur = (list[0] || withPdf[0]).id;
+    if (!ui.cur || !fileById(ui.cur)) { ui.cur = (list[0] || withPdf[0]).id; ui.page = firstTodoPage(fileById(ui.cur)); }
     var f = fileById(ui.cur);
+    if (ui.page > L.pagesOf(f)) ui.page = 1;
     var idx = list.indexOf(f);
-    function go(d) { var arr = list.length ? list : withPdf, i = arr.indexOf(f); var n = arr[(i + d + arr.length) % arr.length]; ui.cur = n.id; ui.page = 1; ui.aiText = ''; ui.lowConf = []; render(); }
+    function firstTodoPage(x) { var pgs = L.sheetPages(x); return pgs.filter(function (pg) { return sheetTodo(an, ids, x, pg); })[0] || pgs[0] || 1; }
+    function pick(n) { ui.cur = n.id; ui.page = firstTodoPage(n); ui.aiText = ''; ui.lowConf = []; render(); }
+    function go(d) { var arr = list.length ? list : withPdf, i = arr.indexOf(f); pick(arr[(i + d + arr.length) % arr.length]); }
     var fileSel = h('select', { 'aria-label': '검사표 파일' }, (idx < 0 ? [f].concat(list) : list).map(function (x) {
-      var v = fileVerdict(an, x.id), i = ids[x.id];
-      return h('option', { value: x.id, selected: x.id === f.id }, '[' + L.VERDICT_LABEL[v] + (i && i.status !== 'ok' ? ' · ' + ID_LABEL[i.status] : '') + '] ' + x.name);
+      var v = fileVerdict(an, x.id), np = L.pagesOf(x);
+      var unk = L.sheetPages(x).some(function (pg) { var i = ids[L.sheetKey(x.id, pg)]; return i && i.status !== 'ok'; });
+      return h('option', { value: x.id, selected: x.id === f.id }, '[' + L.VERDICT_LABEL[v] + (unk ? ' · 식별 필요' : '') + '] ' + x.name + (np > 1 ? ' (' + np + '쪽)' : ''));
     }));
-    fileSel.addEventListener('change', function () { ui.cur = fileSel.value; ui.page = 1; ui.aiText = ''; ui.lowConf = []; render(); });
+    fileSel.addEventListener('change', function () { pick(fileById(fileSel.value)); });
     var filt = h('div', { class: 'tabs', role: 'group', 'aria-label': '파일 거르기', style: 'margin:0' }, [['todo', '할 일(대기 · 보류 · 식별)'], ['fail', '불합격'], ['all', '전체 ' + withPdf.length]].map(function (x) {
       return h('button', { type: 'button', 'aria-pressed': ui.fileFilter === x[0] ? 'true' : 'false', onclick: function () { ui.fileFilter = x[0]; ui.cur = ''; render(); } }, x[1]);
     }));
+    var sk = L.sheetKey(f.id, ui.page);
     return [
-      pageHead('②', '판독 — 검사표 보며 값 옮기기', '글자 층이 있는 검사표는 이미 읽어 두었고, 스캔 그림은 왼쪽을 보며 오른쪽 칸에 적습니다(호기 열 × 항목 줄). 적는 즉시 호기마다 합불이 나옵니다.'),
+      pageHead('②', '판독 — 검사표 보며 값 옮기기', '글자 층이 있는 검사표는 이미 읽어 두었고, 스캔 그림은 왼쪽을 보며 오른쪽 칸에 적습니다(호기 열 × 항목 줄). 적는 즉시 호기마다 합불이 나옵니다. 여러 쪽 PDF 는 쪽마다 따로 판독합니다.'),
       ui.busy ? h('p', { class: 'alert info' }, ui.busy) : null,
       h('div', { class: 'read-bar' }, filt),
       h('div', { class: 'read-bar' },
         h('button', { type: 'button', class: 'btn', onclick: function () { go(-1); } }, '이전'),
         fileSel,
         h('button', { type: 'button', class: 'btn', onclick: function () { go(1); } }, '다음'),
-        list.length ? h('span', { class: 'note' }, (idx >= 0 ? (idx + 1) + ' / ' : '') + list.length + '장') : h('span', { class: 'note' }, '거른 목록이 비었습니다')),
-      h('div', { class: 'read-grid' }, viewerCard(f), readForm(f, ids[f.id], an))
+        list.length ? h('span', { class: 'note' }, (idx >= 0 ? (idx + 1) + ' / ' : '') + list.length + '개') : h('span', { class: 'note' }, '거른 목록이 비었습니다')),
+      h('div', { class: 'read-grid' }, viewerCard(f, sk, an), readForm(f, sk, ids[sk], an))
     ];
   }
-  function viewerCard(f) {
+  var SCOPE_LABEL = { sheet: '이 파일 · 이 쪽만', process: '이 공정 기본', all: '모든 검사표 기본' };
+  /* 고를 범위의 가릴 영역 배열 — create 면 아래 단계(공정 → 모든 검사표)를 복사해 새로 만듦 */
+  function scopeArr(scope, sk, proc, create) {
+    db.maskSheets = db.maskSheets || {}; db.maskProcs = db.maskProcs || {};
+    if (scope === 'all') return db.masks;
+    var pk = L.procKey(proc);
+    if (scope === 'process') { if (!pk) return null; if (!Array.isArray(db.maskProcs[pk]) && create) db.maskProcs[pk] = clone(db.masks); return db.maskProcs[pk] || null; }
+    if (!Array.isArray(db.maskSheets[sk]) && create) db.maskSheets[sk] = clone(L.masksFor(db, '\u0000', proc).masks);
+    return db.maskSheets[sk] || null;
+  }
+  function viewerCard(f, sk, an) {
+    var page = ui.page, proc = procOf(sk), eff = masksOf(sk, proc);
     var box = h('div', { class: 'viewer' + (ui.zoom === 'big' ? ' big' : '') }, h('div', { class: 'viewer-msg' }, '검사표를 그리는 중…'));
     var pagesNote = h('span', { class: 'note' });
     var avail = Math.max(300, (main.clientWidth || 900) - 70 - (window.innerWidth >= 1360 ? 536 : 0));
     var w = Math.round((ui.zoom === 'big' ? 1800 : avail) * Math.min(window.devicePixelRatio || 1, 2));
-    pageCanvas(f, ui.page, w).then(function (c) {
+    pageCanvas(f, page, w).then(function (c) {
       box.innerHTML = '';
       var pw = h('div', { class: 'page-wrap', style: ui.zoom === 'big' ? 'width:1800px' : '' });
       pw.appendChild(c);
-      pw.appendChild(maskLayer());
+      pw.appendChild(maskLayer(sk, proc, eff));
       box.appendChild(pw);
       var np = +c.dataset.pages || 1;
-      pagesNote.textContent = np > 1 ? '쪽 ' + ui.page + ' / ' + np : '1쪽';
-      if (np > 1) pagesNote.appendChild(h('span', null, ' ', h('button', { type: 'button', class: 'btn btn-sm', disabled: ui.page <= 1, onclick: function () { ui.page--; render(); } }, '이전 쪽'), ' ',
-        h('button', { type: 'button', class: 'btn btn-sm', disabled: ui.page >= np, onclick: function () { ui.page++; render(); } }, '다음 쪽')));
+      if (np !== L.pagesOf(f)) { f.pages = np; save(); }
+      pagesNote.textContent = np > 1 ? '쪽 ' + page + ' / ' + np : '1쪽';
+      if (np > 1) pagesNote.appendChild(h('span', null, ' ', h('button', { type: 'button', class: 'btn btn-sm', disabled: page <= 1, onclick: function () { ui.page--; ui.aiText = ''; ui.lowConf = []; render(); } }, '이전 쪽'), ' ',
+        h('button', { type: 'button', class: 'btn btn-sm', disabled: page >= np, onclick: function () { ui.page++; ui.aiText = ''; ui.lowConf = []; render(); } }, '다음 쪽')));
     }, function (e) {
       box.innerHTML = '';
       box.appendChild(h('div', { class: 'viewer-msg' }, e.message === 'nobytes'
         ? '이 브라우저에 PDF 내용이 없습니다(백업을 다른 PC 에서 불러왔거나 브라우저 저장소가 막힘). 자료 넣기에서 같은 PDF 를 다시 넣어 주세요.'
         : 'PDF 를 열지 못했습니다: ' + e.message));
     });
+    // 쪽 방향 — 90° · 180° 돌아간 스캔(2026-11-10 추가 요청). 쪽마다 저장하고 AI 에 보낼 그림도 이 방향으로
+    var rot = rotOf(f, page), auto = f.rotAuto && f.rotAuto[page];
+    function turn(d) { f.rot = f.rot || {}; f.rot[page] = L.normRot(rot + d); if (f.rotAuto) delete f.rotAuto[page]; save(); render(); }
+    var rotBar = h('div', { class: 'btn-row rot-bar', role: 'group', 'aria-label': '쪽 방향' },
+      h('span', { class: 'note' }, '방향 ' + (rot ? '시계 방향 ' + rot + '° 돌림' + (auto ? '(글자 방향으로 자동)' : '') : '그대로')),
+      h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { turn(-90); } }, '왼쪽으로 90°'),
+      h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { turn(90); } }, '오른쪽으로 90°'),
+      h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { turn(180); } }, '180°'),
+      L.pagesOf(f) > 1 ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { f.skip = f.skip || {}; if (f.skip[page]) delete f.skip[page]; else f.skip[page] = true; save(); render(); } }, f.skip && f.skip[page] ? '이 쪽 다시 검사표로' : '이 쪽은 검사표 아님') : null);
+    // 가릴 영역 — 범위 고르기
+    var scopeSel = h('select', { 'aria-label': '가릴 영역을 적용할 범위' }, ['sheet', 'process', 'all'].map(function (k) {
+      return h('option', { value: k, selected: ui.maskScope === k, disabled: k === 'process' && !L.procKey(proc) }, SCOPE_LABEL[k] + (k === 'process' ? (proc ? '(' + proc + ')' : '(공정명을 먼저 적어 주세요)') : ''));
+    }));
+    scopeSel.addEventListener('change', function () { ui.maskScope = scopeSel.value; render(); });
+    var effText = { sheet: '이 파일 · 이 쪽만의 설정', process: '공정 「' + proc + '」 기본', all: '모든 검사표 기본' }[eff.src];
     return h('section', { class: 'card', style: 'padding:14px' },
       h('div', { class: 'btn-row', style: 'margin-bottom:10px;align-items:center' },
-        h('strong', { style: 'margin-right:auto;overflow-wrap:anywhere' }, f.name, ' ', h('span', { class: 'tag' }, kindLabel(f))),
+        h('strong', { style: 'margin-right:auto;overflow-wrap:anywhere' }, f.name, ' ', h('span', { class: 'tag' }, kindLabel(f, page))),
         pagesNote,
         h('button', { type: 'button', class: 'btn btn-sm', 'aria-pressed': ui.zoom === 'big' ? 'true' : 'false', onclick: function () { ui.zoom = ui.zoom === 'big' ? 'fit' : 'big'; render(); } }, ui.zoom === 'big' ? '폭 맞춤' : '크게 보기'),
-        h('button', { type: 'button', class: 'btn btn-sm', 'aria-pressed': ui.drawMask ? 'true' : 'false', onclick: function () { ui.drawMask = !ui.drawMask; render(); } }, ui.drawMask ? '가릴 영역 그리기 끝' : '가릴 영역 그리기')),
-      ui.drawMask ? h('p', { class: 'alert info' }, '검사표 위를 끌어 네모를 그리면, AI 에 보낼 그림에서 그 자리를 흰색으로 덮습니다(결재 칸 · 검사자 서명 등). 모든 검사표에 같은 자리로 적용됩니다.') : null,
+        h('button', { type: 'button', class: 'btn btn-sm', 'aria-pressed': ui.drawMask ? 'true' : 'false', onclick: function () { ui.drawMask = !ui.drawMask; render(); } }, ui.drawMask ? '가릴 영역 고치기 끝' : '가릴 영역 고치기')),
+      rotBar,
+      (f.pageText || {})[page] === false && !rot ? h('p', { class: 'note', style: 'margin:0 0 8px' }, '스캔 그림은 방향을 자동으로 알 수 없습니다. 옆으로 눕거나 거꾸로 된 쪽은 위 단추로 바로 세워 주세요(이 쪽에 저장).') : null,
+      f.skip && f.skip[page] ? h('p', { class: 'alert warn' }, '이 쪽은 「검사표 아님」으로 빼 두었습니다. 출하 대조 · 결과에서 셈하지 않습니다.') : null,
+      ui.drawMask ? h('div', { class: 'alert info mask-help' },
+        h('p', { style: 'margin:0 0 6px' }, '검사표 위를 끌어 네모를 그리면 AI 에 보낼 그림에서 그 자리를 흰색으로 덮습니다(결재 칸 · 검사자 서명). 네모의 × 로 뺍니다. 공정마다 결재 칸 자리가 다르면 「이 공정 기본」, 이 PDF 만 다르면 「이 파일 · 이 쪽만」 으로 그려 주세요.'),
+        fld('적용할 범위', scopeSel)) : null,
       box,
-      db.masks.length ? h('p', { class: 'note', style: 'margin:8px 0 0' }, 'AI 에 보낼 때 가리는 영역 ' + db.masks.length + '곳 (빨간 점선) ',
-        h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { db.masks = []; save(); render(); } }, '모두 지우기')) : null);
+      h('p', { class: 'note', style: 'margin:8px 0 0' }, 'AI 에 보낼 때 가리는 영역 ' + eff.masks.length + '곳 — ' + effText + ' (빨간 점선) ',
+        eff.src === 'sheet' ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { delete db.maskSheets[sk]; save(); render(); toast('이 파일 · 쪽의 따로 맞춘 영역을 지웠습니다 — 공정(또는 모든 검사표) 기본을 씁니다.'); } }, '이 파일 조정 지우기(기본으로)') : null,
+        eff.src === 'process' ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (!confirm('공정 「' + proc + '」 의 기본 가릴 영역을 지울까요? 같은 공정의 모든 검사표에 적용됩니다.')) return; delete db.maskProcs[L.procKey(proc)]; save(); render(); } }, '공정 기본 지우기') : null,
+        eff.src === 'all' && eff.masks.length ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (!confirm('모든 검사표 기본 가릴 영역을 지울까요?')) return; db.masks = []; save(); render(); } }, '모두 지우기') : null));
   }
-  function maskLayer() {
+  function maskLayer(sk, proc, eff) {
     var layer = h('div', { class: 'mask-layer' + (ui.drawMask ? ' drawing' : '') });
-    (db.masks || []).forEach(function (m, i) {
-      layer.appendChild(h('div', { class: 'mask', style: 'left:' + m.x * 100 + '%;top:' + m.y * 100 + '%;width:' + m.w * 100 + '%;height:' + m.h * 100 + '%', title: 'AI 에 보낼 때 가림' }, h('span', null, (m.label || '가릴 영역 ' + (i + 1)))));
+    eff.masks.forEach(function (m, i) {
+      var el = h('div', { class: 'mask', style: 'left:' + m.x * 100 + '%;top:' + m.y * 100 + '%;width:' + m.w * 100 + '%;height:' + m.h * 100 + '%', title: 'AI 에 보낼 때 가림' }, h('span', null, (m.label || '가릴 영역 ' + (i + 1))));
+      if (ui.drawMask) el.appendChild(h('button', { type: 'button', class: 'mask-x', 'aria-label': '이 영역 빼기', title: '빼기(' + SCOPE_LABEL[ui.maskScope] + ')', onpointerdown: function (e) { e.stopPropagation(); }, onclick: function (e) {
+        e.stopPropagation();
+        var arr = scopeArr(ui.maskScope, sk, proc, true);
+        if (!arr) { toast('공정명을 먼저 적어 주세요.', true); return; }
+        var j = arr.findIndex(function (x) { return x.x === m.x && x.y === m.y && x.w === m.w && x.h === m.h; });
+        if (j < 0) { toast('이 영역은 「' + SCOPE_LABEL[ui.maskScope] + '」 설정에 없습니다. 범위를 바꿔 주세요.', true); return; }
+        arr.splice(j, 1); save(); render(); toast('뺐습니다(' + SCOPE_LABEL[ui.maskScope] + ').');
+      } }, '×'));
+      layer.appendChild(el);
     });
     if (!ui.drawMask) return layer;
     var start = null, tmp = null;
@@ -492,29 +592,41 @@
       if (!start) return; var p = rel(e);
       var m = { x: L.round(Math.min(start.x, p.x), 4), y: L.round(Math.min(start.y, p.y), 4), w: L.round(Math.abs(p.x - start.x), 4), h: L.round(Math.abs(p.y - start.y), 4) };
       start = null;
-      if (m.w > 0.01 && m.h > 0.005) { db.masks.push(m); save(); toast('가릴 영역을 더했습니다.'); }
+      if (m.w > 0.01 && m.h > 0.005) {
+        var arr = scopeArr(ui.maskScope, sk, proc, true);
+        if (!arr) toast('공정명을 먼저 적어 주세요.', true);
+        else { arr.push(m); save(); toast('가릴 영역을 더했습니다(' + SCOPE_LABEL[ui.maskScope] + ').'); }
+      }
       render();
     });
     return layer;
   }
-  /* 같은 품번(없으면 모델)의 다른 검사표에서 항목 목록을 가져옵니다 — 스캔 검사표의 칸을 미리 채우는 데 씀 */
+  /* 같은 품번(없으면 모델)의 다른 검사표에서 항목 목록을 가져옵니다 — 스캔 검사표의 칸을 미리 채우는 데 씀.
+     공정명을 알면 같은 공정의 검사표를 먼저, 없으면 공정 기본 항목(시트 = 풍선 체크), 공정이 다른 검사표의 항목은 가져오지 않습니다. */
   function itemsFromOthers(meta, exceptId) {
-    var kp = L.key(meta.part), models = L.splitModels(meta.model).map(L.key), best = null;
+    var kp = L.key(meta.part), models = L.splitModels(meta.model).map(L.key), pk = L.procKey(meta.process), best = null, bestP = null;
+    function better(r, b0) { return !b0 || (r.done && !b0.done) || String(r.at) > String(b0.at); }
     Object.keys(db.readings).forEach(function (id) {
       if (id === exceptId) return;
       var r = db.readings[id];
       if (!r || !r.items || !r.items.length || !r.meta) return;
       var hit = (kp && L.key(r.meta.part) === kp) || (!kp && models.length && L.splitModels(r.meta.model).some(function (m) { return models.indexOf(L.key(m)) >= 0; }));
-      if (hit && (!best || (r.done && !best.done) || String(r.at) > String(best.at))) best = r;
+      if (!hit) return;
+      var rp = L.procKey(r.meta.process);
+      if (pk && rp === pk) { if (better(r, bestP)) bestP = r; }
+      else if (!pk || !rp) { if (better(r, best)) best = r; }
     });
+    if (bestP) return { items: clone(bestP.items), from: '같은 ' + (kp ? '품번' : '모델') + ' · 같은 공정의 다른 검사표' };
+    var pre = L.procPreset(meta.process);
+    if (pre) return { items: pre, from: '시트 공정 기본 항목(풍선 체크)' };
     if (best) return { items: clone(best.items), from: '같은 ' + (kp ? '품번' : '모델') + '의 다른 검사표' };
     var ov = (db.overrides || []).filter(function (o) { return kp && L.key(o.part) === kp; });
     if (ov.length) return { items: ov.map(function (o, i) { return L.cleanItem({ no: /^\d+$/.test(o.item) ? o.item : String(i + 1), label: /^\d+$/.test(o.item) ? '' : o.item, kind: o.kind }, i); }), from: '스펙 덮어쓰기 표' };
     return null;
   }
   /* 판독 초안 — 저장된 기록이 있으면 그것, 없으면 파일 이름 힌트 + 같은 품번 항목으로 */
-  function draftOf(f, info) {
-    var rd = db.readings[f.id];
+  function draftOf(f, sk, info) {
+    var rd = db.readings[sk];
     if (rd) {
       var d = clone(rd);
       d.meta = d.meta || {}; d.items = d.items || []; d.hogis = d.hogis && d.hogis.length ? d.hogis : [{ no: '', values: {} }]; d.problems = d.problems || {};
@@ -527,20 +639,22 @@
     if (info) L.META_IDS.forEach(function (k) { if (info.meta[k]) { meta[k] = info.meta[k]; src[k] = 'filename'; } });
     var hg = info && info.hogis.length ? info.hogis.map(function (x) { return { no: x, values: {} }; }) : [{ no: '', values: {} }];
     if (info && info.hogis.length) src.hogi = 'filename';
-    var pre = itemsFromOthers(meta, f.id);
+    var pre = itemsFromOthers(meta, sk);
     return { meta: meta, src: src, items: pre ? pre.items : [], itemsFrom: pre ? pre.from : '', hogis: hg, problems: {}, done: false, fresh: true };
   }
-  function readForm(f, info, an) {
-    var d = draftOf(f, info);
-    var rd = db.readings[f.id];
+  function noValues(d) { return d.hogis.every(function (x) { return !Object.keys(x.values || {}).some(function (k) { return L.str(x.values[k]); }); }); }
+  function readForm(f, sk, info, an) {
+    var d = draftOf(f, sk, info);
+    var rd = db.readings[sk];
     var touched = false;
+    var verdict = sheetVerdict(an, sk);
     function store(done) {
-      var r0 = db.readings[f.id] || {};
+      var r0 = db.readings[sk] || {};
       var by;
-      if (ui.aiFor === f.id) by = 'AI 읽기 + 사람 확인';
+      if (ui.aiFor === sk) by = 'AI 읽기 + 사람 확인';
       else if (r0.auto === 'text') by = touched ? '글자 층 자동 + 사람 고침' : (r0.by || '글자 층 자동');
       else by = r0.by && r0.by !== '글자 층 자동' ? r0.by : '사람';
-      db.readings[f.id] = { meta: d.meta, items: d.items, hogis: d.hogis.filter(function (x, i) { return x.no || Object.keys(x.values || {}).some(function (k) { return x.values[k]; }) || i === 0; }), problems: d.problems,
+      db.readings[sk] = { meta: d.meta, items: d.items, hogis: d.hogis.filter(function (x, i) { return x.no || Object.keys(x.values || {}).some(function (k) { return x.values[k]; }) || i === 0; }), problems: d.problems,
         auto: r0.auto || '', warnings: r0.warnings, by: by, at: nowText(), done: done == null ? !!r0.done : done };
       save();
     }
@@ -556,8 +670,9 @@
         var v = inp.value.trim();
         d.meta[fd.id] = fd.id === 'date' ? (L.toDate(v) || v) : v; touched = true;
         delete d.src[fd.id];
-        var refill = (fd.id === 'part' || fd.id === 'model') && !d.items.length;
-        if (refill) { var pre = itemsFromOthers(d.meta, f.id); if (pre) { d.items = pre.items; toast('검사 항목을 ' + pre.from + '에서 가져왔습니다.'); } }
+        // 품번 · 모델을 적으면 항목을 가져오고, 공정명을 바꾸면(값을 아직 안 적었을 때) 그 공정의 항목으로 바꿉니다(시트 = 풍선 체크)
+        var refill = ((fd.id === 'part' || fd.id === 'model') && !d.items.length) || (fd.id === 'process' && noValues(d));
+        if (refill) { var pre = itemsFromOthers(d.meta, sk); if (pre) { d.items = pre.items; toast('검사 항목을 ' + pre.from + '에서 가져왔습니다.'); } }
         store(); render();
       });
       metaGrid.appendChild(h('label', { class: 'field' + (d.src[fd.id] === 'filename' ? ' from-name' : '') }, h('span', null, fd.label, d.src[fd.id] === 'filename' ? h('small', { class: 'hint' }, ' 파일 이름에서 짐작') : null), inp));
@@ -576,7 +691,7 @@
     trh.appendChild(h('th', { scope: 'col' }, '문제점(조치)'));
     grid.appendChild(h('thead', null, trh));
     var tb = h('tbody');
-    var lowSet = ui.aiFor === f.id ? ui.lowConf : [];
+    var lowSet = ui.aiFor === sk ? ui.lowConf : [];
     cellsList.forEach(function (c, ci) {
       var first = ci === 0 || cellsList[ci - 1].item !== c.item;
       var span = (c.item.subs.length || 1);
@@ -588,7 +703,7 @@
       }
       tr.appendChild(h('td', { class: 'sub' }, c.sub || ''));
       d.hogis.forEach(function (hg, hi) {
-        var inp = h('input', { value: (hg.values || {})[c.key] || '', inputmode: c.item.kind === 'okng' ? 'text' : 'decimal', 'aria-label': (hg.no || '호기 ' + (hi + 1)) + ' · ' + c.key, autocomplete: 'off', spellcheck: 'false', 'data-k': c.key, 'data-h': hi, class: lowSet.indexOf(c.key) >= 0 ? 'low' : null });
+        var inp = h('input', { value: (hg.values || {})[c.key] || '', inputmode: c.item.kind === 'num' ? 'decimal' : 'text', placeholder: c.item.kind === 'attach' ? 'OK · 23/24' : null, 'aria-label': (hg.no || '호기 ' + (hi + 1)) + ' · ' + c.key, autocomplete: 'off', spellcheck: 'false', 'data-k': c.key, 'data-h': hi, class: lowSet.indexOf(c.key) >= 0 ? 'low' : null });
         inp.addEventListener('input', function () { (hg.values = hg.values || {})[c.key] = inp.value; judgeAll(); });
         inp.addEventListener('change', function () { touched = true; store(); });
         inp.addEventListener('keydown', function (e) {
@@ -622,7 +737,7 @@
         j.cells.forEach(function (x) { by[x.key] = x; });
         valInputs.filter(function (x) { return x.h === hi; }).forEach(function (x) {
           var c = by[x.key], s = c ? c.status : '';
-          x.el.parentNode.className = 'v ' + (s === 'pass' ? (c.near ? 'near' : c.check ? 'chk' : 'pass') : s === 'fail' ? 'fail' : s === 'unread' || s === 'nospec' ? 'hold' : '');
+          x.el.parentNode.className = 'v ' + (s === 'pass' ? (c.near ? 'near' : c.check ? 'chk' : 'pass') : s === 'fail' ? 'fail' : s === 'unread' || s === 'nospec' ? 'hold' : s === 'blank' && L.isDone(rd) ? 'empty' : '');
           x.el.title = c ? (c.msg || (s === 'pass' ? '합격' : '')) : '';
         });
         foot[hi].innerHTML = '';
@@ -641,17 +756,47 @@
       ui.aiText = ''; ui.lowConf = []; ui.aiFor = '';
       toast('저장했습니다 — 호기 ' + d.hogis.filter(function (x) { return x.no; }).length + '대.');
       if (next) {
-        var an2 = analysis(), ids2 = idInfoMap(an2);
-        var nx = db.files.filter(function (x) { return x.hasPdf !== false && x.id !== f.id && (fileVerdict(an2, x.id) === 'wait' || (ids2[x.id] && ids2[x.id].status !== 'ok')); })[0];
-        if (nx) { ui.cur = nx.id; ui.page = 1; }
+        // 다음 할 일 — 같은 파일의 다음 쪽부터, 그다음 다른 파일
+        var an2 = analysis(), ids2 = idInfoMap(an2), order = [];
+        db.files.filter(function (x) { return x.hasPdf !== false; }).forEach(function (x) { L.sheetPages(x).forEach(function (pg) { order.push([x, pg]); }); });
+        var at = order.findIndex(function (o) { return o[0] === f && o[1] === ui.page; });
+        order = order.slice(at + 1).concat(order.slice(0, Math.max(0, at)));
+        var nx = order.filter(function (o) { var v = sheetVerdict(an2, L.sheetKey(o[0].id, o[1])), i = ids2[L.sheetKey(o[0].id, o[1])]; return v === 'wait' || (i && i.status !== 'ok'); })[0];
+        if (nx) { ui.cur = nx[0].id; ui.page = nx[1]; }
       }
       render();
     }
     var notice = rd && rd.auto === 'text' ? h('p', { class: 'alert info' }, '글자 층에서 읽었습니다(' + (rd.by || '') + '). 그림과 다른 칸이 있으면 고친 뒤 「판독 완료」를 눌러 주세요.' + (rd.warnings && rd.warnings.length ? ' 알림: ' + rd.warnings.join(' ') : ''))
-      : f.text === false ? h('p', { class: 'alert warn' }, '그림만 있는 PDF(스캔)입니다. 왼쪽 그림을 보며 머리 칸 · 호기 · 값을 적거나, 아래 「AI 로 읽기」로 채운 뒤 대조해 주세요.' + (d.itemsFrom ? ' 검사 항목은 ' + d.itemsFrom + '에서 가져왔습니다.' : ''))
+      : (f.pageText || {})[ui.page] === false || f.text === false ? h('p', { class: 'alert warn' }, '그림만 있는 쪽(스캔)입니다. 왼쪽 그림을 보며 머리 칸 · 호기 · 값을 적거나, 아래 「AI 로 읽기」로 채운 뒤 대조해 주세요.' + (d.itemsFrom ? ' 검사 항목은 ' + d.itemsFrom + '에서 가져왔습니다.' : ''))
       : null;
+    /* 수동 판독(2026-11-10 추가 요청) — 판독 대기 · 보류인 검사표를 눌러서 바로 칸에 적기.
+       항목이 없으면 같은 공정 · 같은 품번 검사표나 공정 기본(시트 = 풍선 체크)으로, 그것도 없으면 빈 줄 3개로 칸을 만들고 첫 빈 칸에 커서를 둡니다. */
+    function manual() {
+      if (!d.items.length) {
+        var pre = itemsFromOthers(d.meta, sk);
+        d.items = pre ? pre.items : [1, 2, 3].map(function (i) { return L.cleanItem({ no: String(i), label: '' }, i - 1); });
+        toast(pre ? '검사 항목을 ' + pre.from + '에서 가져왔습니다. 값을 적어 주세요.' : '빈 항목 3줄을 만들었습니다. 「검사 항목 고치기」에서 이름 · 규격을 적고 값을 적어 주세요.');
+      }
+      if (!d.hogis.length) d.hogis = [{ no: '', values: {} }];
+      touched = true; store(); ui.focus = sk; render();
+    }
+    function reauto() {
+      if (rd && rd.done && !confirm('지금 판독값을 지우고 글자 층에서 다시 읽을까요?')) return;
+      ui.busy = '글자 층을 다시 읽는 중…'; render();
+      openDoc(f).then(function (pdf) { return readPage(f, pdf, ui.page, true); }).then(function (r) {
+        ui.busy = ''; save(); render(); toast(r && r.ok && r.items.length ? '글자 층에서 다시 읽었습니다.' : '이 쪽은 글자 층으로 읽을 수 없습니다(스캔 그림). 수동 판독이나 AI 로 읽어 주세요.', !(r && r.ok));
+      }, function (e) { ui.busy = ''; render(); toast('다시 읽지 못했습니다: ' + e.message, true); });
+    }
+    var cfgAi = E.load();
+    var manualBar = verdict === 'wait' || verdict === 'hold' || !d.items.length ? h('div', { class: 'alert warn manual-bar' },
+      h('p', { style: 'margin:0 0 8px' }, h('b', null, '이 검사표: ' + (verdict === 'hold' ? '보류' : '판독 대기')), verdict === 'hold' ? ' — 빈 칸이나 못 읽은 칸이 있습니다(색이 칠해진 칸).' : ' — 아직 값이 판정에 들어가지 않았습니다.'),
+      h('div', { class: 'btn-row' },
+        h('button', { type: 'button', class: 'btn btn-primary', onclick: manual }, '수동 판독(직접 입력)'),
+        (f.pageText || {})[ui.page] !== false ? h('button', { type: 'button', class: 'btn', onclick: reauto }, '글자 층에서 다시 읽기') : null,
+        h('button', { type: 'button', class: 'btn', onclick: function () { var el = document.querySelector('details.ai-read'); if (el) { el.open = true; el.scrollIntoView({ block: 'start' }); } } }, E.isReady(cfgAi) ? 'AI 로 읽기(설정됨)' : 'AI 로 읽기(반자동)'))) : null;
     var form = h('section', { class: 'card read-form' },
-      h('h2', null, '값 옮기기'),
+      h('h2', null, '값 옮기기' + (L.pagesOf(f) > 1 ? ' — ' + ui.page + '쪽' : '')),
+      manualBar,
       notice,
       info && info.status === 'hint' ? h('p', { class: 'alert warn' }, '노란 칸은 파일 이름에서 짐작한 것입니다. 검사표 머리 칸 · 호기와 같은지 확인해 주세요.') : null,
       metaGrid, dl, dlm,
@@ -662,26 +807,33 @@
         h('button', { type: 'button', class: 'btn btn-primary', onclick: function () { saveDone(true); } }, '판독 완료 · 다음'),
         h('button', { type: 'button', class: 'btn', onclick: function () { saveDone(false); } }, '판독 완료'),
         h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { d.hogis.push({ no: '', values: {} }); touched = true; store(); render(); } }, '호기 열 더하기'),
-        L.isDone(rd) ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { db.readings[f.id].done = false; save(); render(); toast('다시 「판독 대기」로 돌렸습니다.'); } }, '다시 대기로') : null),
+        L.isDone(rd) ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { db.readings[sk].done = false; save(); render(); toast('다시 「판독 대기」로 돌렸습니다.'); } }, '다시 대기로') : null),
       L.isDone(rd) ? h('p', { class: 'note', style: 'margin:8px 0 0' }, '판독: ' + (rd.by || '') + ' · ' + (rd.at || '')) : null,
-      itemEditor(f, d, function () { touched = true; store(); render(); }),
-      sheetAiPanel(f, d, store));
+      itemEditor(sk, d, function () { touched = true; store(); render(); }),
+      sheetAiPanel(f, sk, d, store));
     if (d.items.length) setTimeout(judgeAll, 0);
+    if (ui.focus === sk) setTimeout(function () {
+      ui.focus = '';
+      var hin = hogiInputs.filter(function (x) { return !x.value; })[0];
+      var empty = valInputs.filter(function (x) { return !x.el.value || /hold|empty/.test(x.el.parentNode.className); })[0];
+      var el = hin || (empty ? empty.el : valInputs[0] && valInputs[0].el);
+      if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); }
+    }, 30);
     return form;
   }
-  function itemEditor(f, d, changed) {
+  function itemEditor(sk, d, changed) {
     var t = h('table', { class: 'list spec' });
     t.appendChild(h('thead', null, h('tr', null, ['No', '검사 항목(규격 글자)', '측정기', '구분', '방식', ''].map(function (x) { return h('th', null, x); }))));
     var tb = h('tbody');
     d.items.forEach(function (it, i) {
       function inp(k, v, w) { var e = h('input', { value: v, 'aria-label': k, style: w ? 'width:' + w : null }); e.addEventListener('change', function () { it[k] = k === 'subs' ? e.value.split(/[,\/\s]+/).filter(Boolean).map(function (s) { return s.toUpperCase(); }) : e.value.trim(); if (k === 'label' || k === 'tool') delete it.kind; d.items[i] = L.cleanItem(it, i); changed(); }); return e; }
-      var kind = h('select', { 'aria-label': '방식' }, [['num', '수치'], ['okng', '육안 OK/NG']].map(function (o) { return h('option', { value: o[0], selected: L.cleanItem(it, i).kind === o[0] }, o[1]); }));
+      var kind = h('select', { 'aria-label': '방식' }, [['num', '수치'], ['okng', '육안 OK/NG'], ['attach', '부착 확인(풍선 체크)']].map(function (o) { return h('option', { value: o[0], selected: L.cleanItem(it, i).kind === o[0] }, o[1]); }));
       kind.addEventListener('change', function () { it.kind = kind.value; changed(); });
       tb.appendChild(h('tr', null, h('td', null, inp('no', it.no, '52px')), h('td', null, inp('label', it.label || '')), h('td', null, inp('tool', it.tool || '')), h('td', null, inp('subs', (it.subs || []).join(','), '80px')), h('td', null, kind),
         h('td', null, h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { d.items.splice(i, 1); changed(); } }, '빼기'))));
     });
     t.appendChild(tb);
-    var pre = itemsFromOthers(d.meta, f.id);
+    var pre = itemsFromOthers(d.meta, sk);
     return h('details', { class: 'block', style: 'margin-top:14px' },
       h('summary', null, '검사 항목 고치기 (' + d.items.length + '개)'),
       h('p', { class: 'note' }, '검사 항목 칸의 「420±1」 「48 +1.0/-0.5」 「1.5 MAX」 같은 글자에서 하한 · 상한을 읽습니다. 구분은 「LH,RH」 처럼 쉼표로. 고치면 이 검사표에만 적용됩니다(⑤ 덮어쓰기 표는 품번 전체).'),
@@ -690,17 +842,18 @@
         h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { d.items.push({ no: String(d.items.length + 1), label: '', tool: '', subs: [] }); changed(); } }, '줄 더하기'),
         pre ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (d.items.length && !confirm('지금 항목을 ' + pre.from + '의 항목으로 바꿀까요?')) return; d.items = pre.items; changed(); } }, pre.from + '에서 가져오기') : null));
   }
-  function sheetAiPanel(f, d, store) {
+  function sheetAiPanel(f, sk, d, store) {
     var prompt = L.buildSheetPrompt(d.items);
     var ans = h('textarea', { rows: 6, placeholder: 'AI 의 답(JSON)을 여기에 붙여 넣어 주세요.', 'aria-label': 'AI 답' });
-    ans.value = ui.aiFor === f.id ? ui.aiText || '' : '';
+    ans.value = ui.aiFor === sk ? ui.aiText || '' : '';
     function apply() {
       var p = L.parseSheetAi(ans.value, d.items);
-      ui.aiText = ans.value; ui.aiFor = f.id;
+      ui.aiText = ans.value; ui.aiFor = sk;
       if (!p.ok) { toast(p.error, true); return; }
       Object.keys(p.meta).forEach(function (k) { d.meta[k] = p.meta[k]; });
-      if (p.items && p.items.length && !d.items.length) d.items = p.items;
-      if (!d.items.length) { var pre = itemsFromOthers(d.meta, f.id); if (pre) d.items = pre.items; }
+      // 답에 항목이 있고, 지금 칸과 맞지 않으면(다른 공정 양식) 답의 항목으로 바꿈
+      if (p.items && p.items.length && (!d.items.length || p.unknown.length)) { d.items = p.items; p = L.parseSheetAi(ans.value, d.items); }
+      if (!d.items.length) { var pre = itemsFromOthers(d.meta, sk); if (pre) d.items = pre.items; }
       if (p.hogis.length) {
         var keep = d.hogis.filter(function (x) { return x.no && !p.hogis.some(function (y) { return L.key(y.no) === L.key(x.no); }); });
         d.hogis = p.hogis.map(function (y) {
@@ -715,13 +868,13 @@
       toast('AI 가 읽은 값을 칸에 넣었습니다. 노란 칸(확신 낮음)부터 검사표와 대조한 뒤 「판독 완료」를 눌러 주세요.' + (p.unknown.length ? ' 모르는 칸: ' + p.unknown.join(', ') : ''));
     }
     function saveImage() {
-      maskedImage(f, ui.page).then(function (c) {
-        c.toBlob(function (b) { download(f.name.replace(/\.pdf$/i, '') + '_가림.jpg', b); toast('그림을 받았습니다(가릴 영역은 흰색). AI 대화창에 이 그림을 첨부해 주세요.'); }, 'image/jpeg', 0.88);
+      maskedImage(f, ui.page, d.meta.process).then(function (c) {
+        c.toBlob(function (b) { download(f.name.replace(/\.pdf$/i, '') + (L.pagesOf(f) > 1 ? '_' + ui.page + '쪽' : '') + '_가림.jpg', b); toast('그림을 받았습니다(가릴 영역은 흰색). AI 대화창에 이 그림을 첨부해 주세요.'); }, 'image/jpeg', 0.88);
       }, function (e) { toast('그림을 만들지 못했습니다: ' + e.message, true); });
     }
     function copyImage() {
       if (!(navigator.clipboard && window.ClipboardItem && window.isSecureContext)) { toast('이 브라우저에서는 그림 복사가 안 됩니다. 「그림 받기」를 써 주세요.', true); return; }
-      maskedImage(f, ui.page).then(function (c) {
+      maskedImage(f, ui.page, d.meta.process).then(function (c) {
         c.toBlob(function (b) { navigator.clipboard.write([new window.ClipboardItem({ 'image/png': b })]).then(function () { toast('그림을 복사했습니다. AI 대화창에 붙여 넣어 주세요.'); }, function () { toast('그림을 복사하지 못했습니다. 「그림 받기」를 써 주세요.', true); }); }, 'image/png');
       });
     }
@@ -731,28 +884,28 @@
       var c = E.load(), v = E.validateConfig(c, location.protocol);
       if (v.errors.length) { toast(v.errors[0], true); return; }
       sendBtn.disabled = true; sendBtn.textContent = '보내는 중…';
-      maskedImage(f, ui.page).then(function (cv) {
+      maskedImage(f, ui.page, d.meta.process).then(function (cv) {
         var msgs = [{ role: 'system', content: '너는 손으로 쓴 제품 검사표의 값을 옮겨 적는 보조야. 그림에 없는 값을 만들지 마.' },
           { role: 'user', content: [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: cv.toDataURL('image/jpeg', 0.88) } }] }];
         return E.callChat(c, msgs, { maxTokens: 2000 });
       }).then(function (text) { ans.value = text; apply(); }, function (e) { toast(e.message, true); sendBtn.disabled = false; sendBtn.textContent = '그림과 함께 AI 서버로 보내기(선택)'; });
     });
-    var truth = f.sample && SM.truth[f.name];
-    var demo = truth && f.text === false ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () {
+    var truth = f.sample && SM.truth[f.name + (ui.page > 1 ? '#' + ui.page : '')];
+    var demo = truth && (f.pageText || {})[ui.page] === false ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () {
       var m = truth.meta, low = [];
       var hogis = truth.hogis.map(function (x) { return { 호기: x.no, 값: x.values }; });
       var firstNum = L.itemCells(truth.items.map(L.cleanItem)).filter(function (c) { return c.item.kind === 'num'; })[0];
       if (firstNum) low.push(firstNum.key);
       var o = { 모델명: m.model.split(' / ')[0], 품번: m.part, 품명: m.name, 관리번호: m.mgmt, 작성일: m.date, 제작공정명: m.process };
-      if (!d.items.length) o['항목'] = truth.items.map(function (it) { return { No: it.no, 검사항목: it.label, 측정기: it.tool, 구분: it.subs }; });
+      o['항목'] = truth.items.map(function (it) { return { No: it.no, 검사항목: it.label, 측정기: it.tool, 구분: it.subs }; });
       o['호기'] = hogis; o['문제점'] = truth.problems; o['확신낮음'] = low;
       ans.value = '```json\n' + JSON.stringify(o, null, 2) + '\n```';
-      ui.aiText = ans.value; ui.aiFor = f.id; toast('가상 「AI 답」 예시를 넣었습니다(샘플 전용). 「답 읽어 칸 채우기」를 눌러 보세요.');
+      ui.aiText = ans.value; ui.aiFor = sk; toast('가상 「AI 답」 예시를 넣었습니다(샘플 전용). 「답 읽어 칸 채우기」를 눌러 보세요.');
     } }, '가상 AI 답 예시 넣기(샘플 전용)') : null;
-    return h('details', { class: 'block', style: 'margin-top:10px', open: !!(ui.aiFor === f.id && ui.aiText) || f.text === false },
+    return h('details', { class: 'block ai-read', style: 'margin-top:10px', open: !!(ui.aiFor === sk && ui.aiText) || (f.pageText || {})[ui.page] === false },
       h('summary', null, 'AI 로 읽기 (반자동 · 선택)'),
       h('ol', { class: 'steps' },
-        h('li', null, '검사표 그림을 받거나 복사합니다. 가릴 영역(결재 칸 · 검사자 서명)은 흰색으로 덮입니다.'),
+        h('li', null, '검사표 그림을 받거나 복사합니다. 가릴 영역(결재 칸 · 검사자 서명)은 흰색으로 덮이고, 돌려 둔 방향 그대로 나갑니다.'),
         h('li', null, '회사가 허용한 AI 대화창에 그림을 첨부하고 아래 프롬프트를 붙여 넣습니다. 이 도구는 기본으로 아무 데도 보내지 않습니다.'),
         h('li', null, 'AI 의 답(JSON)을 붙여 넣고 「답 읽어 칸 채우기」 → 검사표와 대조해 고친 뒤 「판독 완료」.')),
       h('div', { class: 'btn-row' },
@@ -786,16 +939,16 @@
         tile('보류 · 판독 대기', an.units.filter(function (u) { return u.judge.verdict === 'hold'; }).length + ' · ' + an.units.filter(function (u) { return u.judge.verdict === 'wait'; }).length, '빈 칸 · 못 읽은 칸 · 아직 안 옮김'),
         tile('식별 필요 파일', (c.unknown + c.hint) + '장', '모델/품번 · 호기를 못 찾음', c.unknown ? 'over' : null)),
       h('section', { class: 'card' }, h('h2', null, '불합격 리스트 (' + c.unitFail + '대 · ' + an.fails.length + '칸)'),
-        an.fails.length ? table(['출하일', '남은 날', '모델', '품번', '호기', 'No', '검사 항목', '기준', '적힌 값', '내용', '문제점', '검사표'], an.fails.map(function (x) {
-          return { cls: 'row-fail', cells: [x.shipDate || '(출하일정 없음)', ddayCell(x.days), x.model, x.part, h('b', null, x.hogi), x.no + (x.sub ? ' ' + x.sub : ''), x.label, x.spec, x.raw, x.msg, x.problem, x.file] };
-        }), { nw: [0, 1, 4, 5, 7] }) : h('p', { class: 'note' }, '판정한 호기 가운데 불합격이 없습니다.')),
+        an.fails.length ? table(['출하일', '남은 날', '모델', '품번', '공정', '호기', 'No', '검사 항목', '기준', '적힌 값', '내용', '문제점', '검사표'], an.fails.map(function (x) {
+          return { cls: 'row-fail', cells: [x.shipDate || '(출하일정 없음)', ddayCell(x.days), x.model, x.part, x.process, h('b', null, x.hogi), x.no + (x.sub ? ' ' + x.sub : ''), x.label, x.spec, x.raw, x.msg, x.problem, x.file] };
+        }), { nw: [0, 1, 5, 6, 8] }) : h('p', { class: 'note' }, '판정한 호기 가운데 불합격이 없습니다.')),
       h('section', { class: 'card' }, h('h2', null, '호기별 결과 (' + an.units.length + ')'),
-        units.length ? table(['작성일', '모델', '품번', '호기', '판정', '벗어난 칸', '빈 칸 · 확인 필요', '체크만', '출하일', '검사표', '판독'], units.map(function (u) {
+        units.length ? table(['작성일', '모델', '품번', '공정', '호기', '판정', '벗어난 칸', '빈 칸 · 확인 필요', '체크만', '출하일', '검사표', '판독'], units.map(function (u) {
           var j = u.judge, s = shipOf[u.id];
-          return { cls: j.verdict === 'fail' ? 'row-fail' : null, cells: [u.meta.date || '-', u.meta.model || '', u.meta.part || '', h('b', null, u.hogi), st(j.verdict),
+          return { cls: j.verdict === 'fail' ? 'row-fail' : null, cells: [u.meta.date || '-', u.meta.model || '', u.meta.part || '', u.meta.process || '', h('b', null, u.hogi), st(j.verdict),
             failText(j), [j.blanks.length ? '빈 칸 ' + j.blanks.length : '', j.unreads.length ? '확인 ' + j.unreads.length : ''].filter(Boolean).join(' · '), j.checks.length || '',
-            s ? s.date : '-', u.file.name, u.done ? u.by : ''] };
-        }), { nw: [0, 3, 8] }) : h('p', { class: 'note' }, '호기를 찾은 검사표가 없습니다.')),
+            s ? s.date : '-', sheetName(u.file, u.page), u.done ? u.by : readLink(u.fileId, u.page, '수동 판독', true)] };
+        }), { nw: [0, 4, 9] }) : h('p', { class: 'note' }, '호기를 찾은 검사표가 없습니다.')),
       h('div', { class: 'grid-2' },
         h('section', { class: 'card' }, h('h2', null, '품번별'),
           table(['품번(모델)', '호기', '판정', '불합격', '불합격률', '보류', '대기'], parts.map(function (p) { return [p.part, p.units, p.judged, p.fail, pct(p.failRate), p.hold, p.wait]; }), { num: [0, 1, 1, 1, 1, 1, 1] })),
@@ -809,22 +962,22 @@
     function sheet(name, head, rows) { XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head].concat(rows)), name); }
     var shipOf = {};
     an.rows.forEach(function (r) { r.units.forEach(function (u) { shipOf[u.id] = r.ship; }); });
-    sheet('불합격_리스트', ['출하일', '남은 날', '모델', '품번', '품명', '호기', 'No', '구분', '검사 항목', '기준', '적힌 값', '내용', '문제점(조치)', '작성일', '검사표'],
-      an.fails.map(function (x) { return [x.shipDate, L.dday(x.days), x.model, x.part, x.name, x.hogi, x.no, x.sub, x.label, x.spec, x.raw, x.msg, x.problem, x.sheetDate, x.file]; }));
-    sheet('검사_결과', ['작성일', '모델', '품번', '품명', '관리 번호', '호기', '판정', '벗어난 칸', '빈 칸', '확인 필요', '체크만', '출하일', '검사표', '판독', '판독 시각'], an.units.map(function (u) {
+    sheet('불합격_리스트', ['출하일', '남은 날', '모델', '품번', '품명', '호기', 'No', '구분', '검사 항목', '기준', '적힌 값', '내용', '문제점(조치)', '작성일', '검사표', '공정'],
+      an.fails.map(function (x) { return [x.shipDate, L.dday(x.days), x.model, x.part, x.name, x.hogi, x.no, x.sub, x.label, x.spec, x.raw, x.msg, x.problem, x.sheetDate, x.file, x.process]; }));
+    sheet('검사_결과', ['작성일', '모델', '품번', '품명', '관리 번호', '호기', '판정', '벗어난 칸', '빈 칸', '확인 필요', '체크만', '출하일', '검사표', '판독', '판독 시각', '공정'], an.units.map(function (u) {
       var j = u.judge, s = shipOf[u.id];
-      return [u.meta.date || '', u.meta.model || '', u.meta.part || '', u.meta.name || '', u.meta.mgmt || '', u.hogi, L.VERDICT_LABEL[j.verdict], failText(j), j.blanks.map(function (x) { return x.key; }).join(', '), j.unreads.map(function (x) { return x.key; }).join(', '), j.checks.length, s ? s.date : '', u.file.name, u.done ? u.by : '', u.done ? u.at : ''];
+      return [u.meta.date || '', u.meta.model || '', u.meta.part || '', u.meta.name || '', u.meta.mgmt || '', u.hogi, L.VERDICT_LABEL[j.verdict], failText(j), j.blanks.map(function (x) { return x.key; }).join(', '), j.unreads.map(function (x) { return x.key; }).join(', '), j.checks.length, s ? s.date : '', sheetName(u.file, u.page), u.done ? u.by : '', u.done ? u.at : '', u.meta.process || ''];
     }));
     var long = [];
-    an.units.forEach(function (u) { u.judge.cells.forEach(function (c) { long.push([u.meta.part || '', u.meta.model || '', u.hogi, c.no, c.sub, c.label, c.spec, c.raw, c.value == null ? '' : c.value, ({ pass: '합격', fail: '불합격', blank: '빈 칸', unread: '확인 필요', nospec: '규격 없음' })[c.status], c.msg, u.file.name]); }); });
+    an.units.forEach(function (u) { u.judge.cells.forEach(function (c) { long.push([u.meta.part || '', u.meta.model || '', u.hogi, c.no, c.sub, c.label, c.spec, c.raw, c.value == null ? '' : c.value, ({ pass: '합격', fail: '불합격', blank: '빈 칸', unread: '확인 필요', nospec: '규격 없음' })[c.status], c.msg, sheetName(u.file, u.page)]); }); });
     sheet('측정값_전체', ['품번', '모델', '호기', 'No', '구분', '검사 항목', '기준', '적힌 값', '읽은 값', '판정', '내용', '검사표'], long);
-    var ship = function (statuses) { return L.shipList(an, statuses).map(function (r) { return [r.ship.date, L.dday(r.days), r.ship.model, r.ship.part, r.ship.hogi, r.ship.qty, L.VERDICT_LABEL[r.status], r.unit ? failText(r.unit.judge) || holdText(r) : '', r.notes.join(' · '), r.unit ? r.unit.file.name : '']; }); };
+    var ship = function (statuses) { return L.shipList(an, statuses).map(function (r) { return [r.ship.date, L.dday(r.days), r.ship.model, r.ship.part, r.ship.hogi, r.ship.qty, L.VERDICT_LABEL[r.status], r.unit ? failText(r.unit.judge) || holdText(r) : '', r.notes.join(' · '), r.unit ? sheetName(r.unit.file, r.unit.page) : '']; }); };
     var sh = ['출하일', '남은 날', '모델', '품번', '호기', '수량', '상태', '내용', '알림', '검사표'];
     sheet('출하_대조', sh, ship(['none', 'fail', 'wait', 'hold', 'pass']));
     sheet('검사표_없음', sh, ship(['none']));
     sheet('미판정', sh, ship(['wait', 'hold']));
-    sheet('식별_필요', ['파일', '상태', '짐작한 모델', '짐작한 품번', '짐작한 호기', '모자란 것'], an.ids.filter(function (i) { return i.status !== 'ok'; }).map(function (i) { return [i.file.name, ID_LABEL[i.status], i.meta.model || '', i.meta.part || '', i.hogis.join(', '), i.missing.join(', ')]; }));
-    sheet('출하일정에_없는_검사', ['작성일', '모델', '품번', '호기', '판정', '검사표'], an.extra.map(function (u) { return [u.meta.date || '', u.meta.model || '', u.meta.part || '', u.hogi, L.VERDICT_LABEL[u.judge.verdict], u.file.name]; }));
+    sheet('식별_필요', ['파일', '상태', '짐작한 모델', '짐작한 품번', '짐작한 호기', '모자란 것'], an.ids.filter(function (i) { return i.status !== 'ok'; }).map(function (i) { return [sheetName(i.file, i.page), ID_LABEL[i.status], i.meta.model || '', i.meta.part || '', i.hogis.join(', '), i.missing.join(', ')]; }));
+    sheet('출하일정에_없는_검사', ['작성일', '모델', '품번', '호기', '판정', '검사표'], an.extra.map(function (u) { return [u.meta.date || '', u.meta.model || '', u.meta.part || '', u.hogi, L.VERDICT_LABEL[u.judge.verdict], sheetName(u.file, u.page)]; }));
     XLSX.writeFile(wb, '검사결과_' + stamp() + '.xlsx');
   }
 
@@ -860,13 +1013,14 @@
     Object.keys(db.readings).forEach(function (id) {
       var r = db.readings[id]; if (!r || !r.items || !r.items.length || !r.meta) return;
       var k = r.meta.part || r.meta.model; if (!k) return;
+      if (r.meta.process) k += ' · ' + r.meta.process;      // 공정마다 양식이 달라(제작 · 시트 · 도장 …) 품번 + 공정으로 따로
       if (!latest[k] || String(r.at) > String(latest[k].at)) latest[k] = r;
     });
     var parts = Object.keys(latest).sort();
     var rows = db.overrides;
     function upd(i, k, v) {
       var s0 = Object.assign({}, rows[i]); s0[k] = v;
-      var c = L.cleanSpec({ part: s0.part, item: s0.item, lower: s0.lower, upper: s0.upper, unit: s0.unit, kind: s0.kind === 'okng' ? 'OK/NG' : '수치' });
+      var c = L.cleanSpec({ part: s0.part, item: s0.item, lower: s0.lower, upper: s0.upper, unit: s0.unit, kind: s0.kind === 'okng' ? 'OK/NG' : s0.kind === 'attach' ? '부착' : '수치' });
       if (c.error && !/바꿔 넣/.test(c.error)) toast(c.error, true);
       delete c.error; rows[i] = c; save(); render();
     }
@@ -875,19 +1029,19 @@
     var tb = h('tbody');
     rows.forEach(function (s0, i) {
       function inp(k, num) { var e = h('input', { value: s0[k] == null ? '' : s0[k], inputmode: num ? 'decimal' : null, 'aria-label': k }); e.addEventListener('change', function () { upd(i, k, e.value); }); return e; }
-      var kind = h('select', { 'aria-label': '방식' }, [['num', '수치'], ['okng', '육안 OK/NG']].map(function (o) { return h('option', { value: o[0], selected: s0.kind === o[0] }, o[1]); }));
+      var kind = h('select', { 'aria-label': '방식' }, [['num', '수치'], ['okng', '육안 OK/NG'], ['attach', '부착 확인(풍선)']].map(function (o) { return h('option', { value: o[0], selected: s0.kind === o[0] }, o[1]); }));
       kind.addEventListener('change', function () { upd(i, 'kind', kind.value); });
-      tb.appendChild(h('tr', null, h('td', null, inp('part')), h('td', null, inp('item')), h('td', null, s0.kind === 'okng' ? '-' : inp('lower', true)), h('td', null, s0.kind === 'okng' ? '-' : inp('upper', true)), h('td', null, inp('unit')), h('td', null, kind),
+      tb.appendChild(h('tr', null, h('td', null, inp('part')), h('td', null, inp('item')), h('td', null, s0.kind !== 'num' ? '-' : inp('lower', true)), h('td', null, s0.kind !== 'num' ? '-' : inp('upper', true)), h('td', null, inp('unit')), h('td', null, kind),
         h('td', null, h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { rows.splice(i, 1); save(); render(); } }, '빼기'))));
     });
     t.appendChild(tb);
     return [
       pageHead('⑤', '스펙 — 검사표에서 읽은 규격 · 덮어쓰기', '규격은 검사표 「검사 항목」 칸의 글자(420±1 · 48 +1.0/-0.5 · 1.5 MAX · MIN 40 · 8.00~8.10)에서 읽습니다. 다른 기준을 쓰려면 아래 덮어쓰기 표에 품번 · 항목(또는 No) · 하한 · 상한을 넣습니다.',
         h('div', { class: 'btn-row' },
-          h('button', { type: 'button', class: 'btn', onclick: function () { rows.push({ part: parts[0] || '', item: '', lower: null, upper: null, unit: '', kind: 'num' }); save(); render(); } }, '덮어쓰기 줄 더하기'),
+          h('button', { type: 'button', class: 'btn', onclick: function () { rows.push({ part: parts[0] ? (latest[parts[0]].meta.part || latest[parts[0]].meta.model) : '', item: '', lower: null, upper: null, unit: '', kind: 'num' }); save(); render(); } }, '덮어쓰기 줄 더하기'),
           h('button', { type: 'button', class: 'btn', disabled: !rows.length, onclick: function () {
             var wb = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['품번', '검사 항목', '하한', '상한', '단위', '판정 방식']].concat(rows.map(function (s0) { return [s0.part, s0.item, s0.lower, s0.upper, s0.unit, s0.kind === 'okng' ? 'OK/NG' : '수치']; }))), '스펙덮어쓰기');
+            XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['품번', '검사 항목', '하한', '상한', '단위', '판정 방식']].concat(rows.map(function (s0) { return [s0.part, s0.item, s0.lower, s0.upper, s0.unit, s0.kind === 'okng' ? 'OK/NG' : s0.kind === 'attach' ? '부착' : '수치']; }))), '스펙덮어쓰기');
             XLSX.writeFile(wb, '스펙덮어쓰기_' + stamp() + '.xlsx');
           } }, '덮어쓰기 표 엑셀로'))),
       parts.length ? parts.map(function (p) {
@@ -907,7 +1061,10 @@
           h('li', null, '하한 · 상한과 같은 값은 ' + (settings().inclusive ? '합격' : '불합격') + '으로 봅니다(420±1 이면 419 · 421 은 ' + (settings().inclusive ? '합격' : '불합격') + ').'),
           h('li', null, '육안 항목은 OK / NG(○ · × 도 읽음). NG 는 불합격.'),
           h('li', null, '빈 칸이 있으면 ' + (settings().blankAs === 'hold' ? '보류(미판정)' : '적힌 칸만으로 판정') + ', 못 읽은 칸(「?」) · 규격을 못 읽은 항목은 보류입니다.'),
-          h('li', null, '값 없이 체크(V · ✓)만 한 수치 칸은 ' + (settings().checkAs === 'pass' ? '확인한 것으로 보고 합격' : '값이 없어 보류') + '입니다.')))
+          h('li', null, '측정값 칸에는 실측값 또는 OK 를 적습니다. 수치 항목에 「OK」 가 적혀 있으면 검사자가 공차 안을 확인한 것으로 보고 합격, 「NG」 는 불합격입니다.'),
+          h('li', null, '값 없이 체크(V · ✓)만 한 수치 칸은 ' + (settings().checkAs === 'pass' ? '확인한 것으로 보고 합격' : '값이 없어 보류') + '입니다.'),
+          h('li', null, '시트 공정(부착 확인)은 모델링 뷰의 풍선 체크로 판정합니다 — 「OK」(모두 체크) 또는 「체크 수/풍선 수」(23/24 면 1개 빠져 불합격), 「누락」 · 「NG」 는 불합격.'),
+          h('li', null, '같은 호기의 공정별 검사표(제작 · 시트 · 도장 …)는 모두 봅니다. 하나라도 불합격이면 그 호기는 불합격, 하나라도 판독 전이면 미판정입니다. 같은 공정이 둘이면 나중에 판독한 것을 씁니다.')))
     ];
   }
 
@@ -934,9 +1091,13 @@
         h('div', { class: 'btn-row', style: 'margin-top:12px' }, h('button', { type: 'button', class: 'btn btn-primary', onclick: function () {
           db.settings = L.cleanSettings(Object.assign({}, db.settings, { inclusive: inc.value === '1', blankAs: blank.value, checkAs: chk.value, nearPct: near.value })); save(); render(); toast('저장했습니다.');
         } }, '저장'))),
-      h('section', { class: 'card' }, h('h2', null, 'AI 에 보낼 그림에서 가리는 영역 (' + db.masks.length + '곳)'),
-        h('p', { class: 'note' }, '② 판독 화면의 「가릴 영역 그리기」로 정합니다. 쪽 크기 대비 비율이라 같은 양식이면 모든 검사표에 같은 자리로 적용됩니다(결재 칸 · 검사자 서명).'),
-        db.masks.length ? h('div', { class: 'btn-row' }, h('button', { type: 'button', class: 'btn', onclick: function () { db.masks = []; save(); render(); } }, '모두 지우기')) : null),
+      h('section', { class: 'card' }, h('h2', null, 'AI 에 보낼 그림에서 가리는 영역'),
+        h('p', { class: 'note' }, '② 판독 화면의 「가릴 영역 고치기」로 정합니다. 쪽 크기 대비 비율입니다. 세 겹으로 두고 좁은 것이 먼저입니다 — 이 파일 · 쪽만 > 공정 기본 > 모든 검사표 기본. 공정마다 결재 칸 자리가 다르면 공정 기본을, 한 PDF 만 다르면 그 파일에서 따로 맞춰 주세요.'),
+        table(['범위', '설정', ''], [
+          ['모든 검사표 기본', db.masks.length + '곳', db.masks.length ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (confirm('모든 검사표 기본 영역을 지울까요?')) { db.masks = []; save(); render(); } } }, '지우기') : '']
+        ].concat(Object.keys(db.maskProcs || {}).map(function (k) {
+          return ['공정 기본 — ' + k, db.maskProcs[k].length + '곳', h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { delete db.maskProcs[k]; save(); render(); } }, '지우기')];
+        })).concat(Object.keys(db.maskSheets || {}).length ? [['파일 · 쪽별', Object.keys(db.maskSheets).length + '개 검사표', h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (confirm('파일 · 쪽별로 맞춘 영역을 모두 지울까요?')) { db.maskSheets = {}; save(); render(); } } }, '모두 지우기')]] : []))),
       AIP.settingsCard({ toast: toast, onChange: render }),
       h('section', { class: 'card' }, h('h2', null, '백업'),
         h('p', { class: 'note' }, '출하일정 · 파일 목록 · 판독값 · 덮어쓰기 표는 이 브라우저에만 있습니다. 다른 PC 로 옮기거나 브라우저 정리 전에 JSON 으로 받아 두세요. PDF 내용은 백업에 넣지 않습니다(용량).'),
@@ -968,7 +1129,7 @@
     document.getElementById('dataChip').textContent = db.ships.length || db.files.length ? '출하 ' + c.ships + '대 · 검사표 없음 ' + c.none + ' · 불합격 ' + c.fail + ' · 미판정 ' + c.undecided : '자료 없음';
     var b = document.getElementById('sampleBanner');
     b.hidden = !db.sample;
-    b.textContent = '지금 보시는 것은 가상 샘플입니다(가짜 모델 MODEL-A100 · B200, 품번 QA-…, 검사표 6장 — 글자 층 4 · 스캔 그림 2, 기준일 ' + (db.refDate || '') + '). 실제 자료를 넣기 전에 설정의 「모든 자료 지우기」를 해 주세요.';
+    b.textContent = '지금 보시는 것은 가상 샘플입니다(가짜 모델 MODEL-A100 · B200, 품번 QA-…, 검사표 PDF 7개 — 글자 층 4 · 스캔 그림 2 · 합본 1(1쪽 자주 검사 + 2쪽 시트, 2쪽은 누운 스캔), 기준일 ' + (db.refDate || '') + '). 실제 자료를 넣기 전에 설정의 「모든 자료 지우기」를 해 주세요.';
     main.innerHTML = '';
     add(main, p.fn());
     document.title = p.t + ' — 불량 제품 파악';
@@ -983,7 +1144,8 @@
   else {
     render();
     // 글자 층을 아직 확인하지 않은 파일(백업을 불러온 경우 등)
-    var unchecked = db.files.filter(function (f) { return f.hasPdf !== false && f.text == null && !db.readings[f.id]; });
+    // 여러 쪽 PDF 는 2026-11-10 전까지 1쪽만 읽었으니 쪽별 기록(pageText)이 없으면 나머지 쪽도 읽음(1쪽 판독값은 그대로 둠)
+    var unchecked = db.files.filter(function (f) { return f.hasPdf !== false && ((f.text == null && !db.readings[f.id]) || (L.pagesOf(f) > 1 && !f.pageText)); });
     if (unchecked.length) autoReadAll(unchecked);
   }
 })();

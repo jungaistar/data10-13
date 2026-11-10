@@ -36,9 +36,11 @@ const S0 = L.cleanSettings({});
 const num = (lower, upper) => ({ kind: 'num', lower, upper, unit: '' });
 const verdictOf = (spec, raw, s) => L.judgeItem(spec, raw, s || S0).status;
 // 샘플 파일을 앱과 같은 모양으로
-const sampleFiles = () => SM.files.map(f => ({ id: L.fileId(f.name, f.size), name: f.name, size: f.size, text: f.kind === 'text' }));
+// 여러 쪽 샘플(kind 'multi')은 쪽마다 종류가 다름(pages: ['text', 'scan']) — 정답 열쇠는 1쪽 「이름」, 2쪽부터 「이름#2」
+const pageKinds = (f) => f.pages || [f.kind];
+const sampleFiles = () => SM.files.map(f => ({ id: L.fileId(f.name, f.size), name: f.name, size: f.size, text: pageKinds(f)[0] === 'text', pages: pageKinds(f).length }));
 const readingOf = (name) => { const t = JSON.parse(JSON.stringify(SM.truth[name])); return { meta: t.meta, items: t.items, hogis: t.hogis, problems: t.problems, done: true, by: '시험', at: '2026-10-28 09:00' }; };
-const readingsFor = (kinds) => { const o = {}; SM.files.forEach(f => { if (kinds.includes(f.kind)) o[L.fileId(f.name, f.size)] = readingOf(f.name); }); return o; };
+const readingsFor = (kinds) => { const o = {}; SM.files.forEach(f => { pageKinds(f).forEach((k, i) => { if (kinds.includes(k)) o[L.sheetKey(L.fileId(f.name, f.size), i + 1)] = readingOf(f.name + (i ? '#' + (i + 1) : '')); }); }); return o; };
 
 console.log('규격 글자 읽기');
 await test('대칭 공차 — 420±1 · 2740 ± 6 mm · 85+/-2 · 앞의 항목 이름 · 지름 기호, 단위는 기억만', () => {
@@ -212,23 +214,30 @@ await test('호기 칸 나누기 — 범위 · 쉼표 · 숫자 · # · 「호�
   assert.deepEqual(L.splitHogi('1~500'), ['1~500']);
   assert.deepEqual(L.splitHogi(''), []);
 });
-await test('출하 대조(샘플, 글자 층만 읽은 상태) — 검사표 없음 5 · 불합격 1 · 미판정 2(대기 1 · 보류 1) · 합격 5 · 출하일정에 없는 검사 1', () => {
+await test('출하 대조(샘플, 글자 층만 읽은 상태) — 검사표 없음 4 · 불합격 1 · 미판정 3(대기 2 · 보류 1) · 합격 5 · 출하일정에 없는 검사 1', () => {
   const an = L.analyze(SM.ships, sampleFiles(), readingsFor(['text']), [], S0, SM.refDate);
   const c = an.counts;
-  assert.deepEqual([c.ships, c.none, c.fail, c.wait, c.hold, c.pass, c.extra, c.unknown, c.hint], [13, 5, 1, 1, 1, 5, 1, 1, 1]);
+  assert.deepEqual([c.ships, c.none, c.fail, c.wait, c.hold, c.pass, c.extra, c.unknown, c.hint], [13, 4, 1, 2, 1, 5, 1, 1, 2]);
   const st = Object.fromEntries(an.rows.map(r => [r.ship.hogi, r.status]));
   assert.deepEqual([st['315010'], st['315012'], st['315013'], st['314503'], st['314504'], st['314505']], ['fail', 'pass', 'hold', 'pass', 'wait', 'none']);
   assert.deepEqual(an.fails.map(x => [x.hogi, x.no + ' ' + x.sub, x.raw, x.problem]), [['315010', '3 LH', '49.3', '재가공 후 재측정']]);
   assert.equal(an.extra[0].hogi, '314499');
   // 출하일 순 · 남은 날
   const none = L.shipList(an, ['none']);
-  assert.deepEqual(none.map(r => [r.ship.hogi, L.dday(r.days)]), [['314505', 'D-5'], ['314506', 'D-6'], ['315014', 'D-7'], ['315015', 'D-8'], ['315016', 'D-8']]);
+  assert.deepEqual(none.map(r => [r.ship.hogi, L.dday(r.days)]), [['314505', 'D-5'], ['315014', 'D-7'], ['315015', 'D-8'], ['315016', 'D-8']]);
+  // 합본(1쪽 자주 검사 합격 + 2쪽 시트 판독 전) — 공정 둘을 모두 봐서 「판독 대기」
+  const r506 = an.rows.find(r => r.ship.hogi === '314506');
+  assert.deepEqual([r506.status, r506.procs.length, r506.procs.map(x => x.verdict)], ['wait', 2, ['pass', 'wait']]);
   assert.match(an.rows.find(r => r.ship.hogi === '314504').notes.join(), /파일 이름으로만/);
 });
 await test('스캔 2장까지 판독하면 — 품번 없는 출하 줄은 모델+호기로 짝지어 외관 NG 불합격, 상한과 같은 421 은 합격', () => {
   const an = L.analyze(SM.ships, sampleFiles(), readingsFor(['text', 'scan']), [], S0, SM.refDate);
   const c = an.counts;
-  assert.deepEqual([c.none, c.fail, c.wait, c.hold, c.pass, c.unknown, c.hint], [4, 2, 0, 1, 6, 0, 0]);
+  assert.deepEqual([c.none, c.fail, c.wait, c.hold, c.pass, c.unknown, c.hint], [3, 3, 0, 1, 6, 0, 0]);
+  // 합본 2쪽 시트 — 풍선 24개 중 23개 체크 → 그 호기는 불합격(1쪽 자주 검사는 합격이어도)
+  const r506 = an.rows.find(r => r.ship.hogi === '314506');
+  assert.deepEqual([r506.status, r506.unit.page, r506.unit.meta.process], ['fail', 2, '시트 부착']);
+  assert.ok(an.fails.some(x => x.hogi === '314506' && x.raw === '23/24' && /2쪽/.test(x.file) && x.process === '시트 부착'));
   const r505 = an.rows.find(r => r.ship.hogi === '314505');
   assert.deepEqual([r505.status, r505.how], ['fail', 'model']);
   assert.equal(an.rows.find(r => r.ship.hogi === '314504').status, 'pass');
@@ -283,9 +292,117 @@ await test('그림을 함께 보내는 요청 — 이미지 칸이 든 messages 
   assert.equal(E.STORE_KEY, 'data10-13.ai');
 });
 
+console.log('2026-11-10 요청 반영');
+await test('측정값 칸은 실측값 또는 OK(답 ①) — 수치 항목에 OK 는 합격(설정과 관계없이), NG 는 불합격, V 만 한 칸은 종전대로 설정을 따름', () => {
+  const sp = num(419, 421);
+  const ok = L.judgeItem(sp, 'OK', L.cleanSettings({ checkAs: 'hold' }));
+  assert.deepEqual([ok.status, ok.okMark, ok.check], ['pass', true, false]);
+  assert.equal(verdictOf(sp, 'ok'), 'pass');
+  assert.equal(verdictOf(sp, 'NG'), 'fail');
+  assert.equal(verdictOf(sp, 'V', L.cleanSettings({ checkAs: 'hold' })), 'unread');
+  const j = L.judgeUnit({ items: [{ no: '1', label: '420±1' }, { no: '2', label: '85±2' }], values: { '1': 'OK', '2': '85.5' }, meta: {}, done: true }, [], S0);
+  assert.deepEqual([j.verdict, j.checks.length], ['pass', 0]);
+});
+await test('시트 공정(답 ①) — 풍선 체크: OK · V · 「24/24」 합격, 「23/24」 · 누락 · NG 불합격, 「25/24」 는 확인 필요 · 공정명에 「시트」 면 이 항목으로 시작', () => {
+  const at = { kind: 'attach' };
+  assert.deepEqual(['OK', 'V', '✓', '24/24', '전부'].map(v => verdictOf(at, v)), ['pass', 'pass', 'pass', 'pass', 'pass']);
+  assert.deepEqual(['23/24', '누락', 'NG', '미부착'].map(v => verdictOf(at, v)), ['fail', 'fail', 'fail', 'fail']);
+  assert.match(L.judgeItem(at, '23 / 24', S0).msg, /24개 중 1개 체크 없음/);
+  assert.equal(verdictOf(at, '25/24'), 'unread');
+  assert.equal(verdictOf(at, ''), 'blank');
+  assert.equal(L.cleanItem({ no: '1', label: '시트 부착 확인(모델링 뷰 풍선 체크)' }, 0).kind, 'attach');
+  assert.equal(L.specText(L.resolveSpec(L.cleanItem({ no: '1', label: '풍선 체크' }, 0), '', [])), '부착 확인(풍선 체크)');
+  assert.equal(L.procPreset('시트 부착')[0].kind, 'attach');
+  assert.equal(L.procPreset('SEAT')[0].no, '1');
+  assert.equal(L.procPreset('ASSY 검사'), null);
+  assert.match(L.buildSheetPrompt(L.procPreset('시트 부착')), /체크 수\/풍선 수/);
+});
+await test('다른 공정 양식의 규격 글자 — 「80㎛↑ 관리」 는 하한, 「진직도2↓」 는 상한 · 머리 칸 MODEL · P/No. · PART NAME · C/No. · 검사일', () => {
+  const a = L.parseSpecString('도막측정기 (80㎛↑ 관리)'), b = L.parseSpecString('진직도2↓');
+  assert.deepEqual([a.ok, a.lower, a.upper, a.unit], [true, 80, null, '㎛']);
+  assert.deepEqual([b.ok, b.lower, b.upper], [true, null, 2]);
+  assert.equal(verdictOf(L.resolveSpec({ no: '3', label: '도막 두께 80㎛↑', kind: 'num' }, '', []), '79'), 'fail');
+  const t = (s, x, y) => ({ s, x, y, w: s.length * 6, h: 8, cx: x + s.length * 3 });
+  const r = L.parseSheetText([t('MODEL', 10, 10), t('M-1', 60, 10), t('P/No.', 120, 10), t('QA-1', 160, 10), t('PART NAME', 10, 30), t('프레임', 80, 30), t('C/No.', 140, 30), t('QF-1', 180, 30), t('검사일', 10, 50), t('2026.11.02', 60, 50)]);
+  assert.deepEqual([r.meta.model, r.meta.part, r.meta.name, r.meta.mgmt, r.meta.date], ['M-1', 'QA-1', '프레임', 'QF-1', '2026-11-02']);
+});
+await test('초대형 출하일정 형식(답 ③) — 제목 줄 · 두 줄 머리 · 「모   델」 · 품번 칸 없음 · 「11/10」 은 기준 연도로 · 호기 범위 펼침', () => {
+  const r = L.parseShip(aoaOf('출하일정_초대형형식_샘플.xlsx'), null, { year: 2026 });
+  assert.equal(r.det.headerRow, 2);
+  assert.deepEqual([r.det.map.model, r.det.map.hogi, r.det.map.date, r.det.map.part], [4, 5, 8, undefined]);
+  assert.deepEqual(r.rows.map(x => [x.date, x.model, x.hogi]), [['2026-11-10', 'MODEL-C300L', '520101'], ['2026-11-10', 'MODEL-D500', '610907'], ['2026-11-12', 'MODEL-A100L', '314501'], ['2026-11-14', 'MODEL-C300L', '520102'], ['2026-11-14', 'MODEL-C300L', '520103']]);
+  assert.deepEqual(r.warnings.map(w => w.msg), ['연도 없이 「월/일」로 적힌 출하일 4줄은 2026년으로 봤습니다(기준일의 연도).']);   // Center · Side 둘째 머리 줄은 조용히 건너뜀
+  assert.match(L.parseShip(aoaOf('출하일정_초대형형식_샘플.xlsx')).warnings.map(w => w.msg).join(), /출하일을 읽지 못했습니다/);   // 연도를 안 주면 읽지 않고 알림
+});
+await test('출하일정 합치기(소형 · 초대형 · 버켓 파일) · 모델 이름이 조금 달라도(「MODEL-A100L」 ↔ 「MODEL-A100」) 같은 호기면 짝', () => {
+  const big = L.parseShip(aoaOf('출하일정_초대형형식_샘플.xlsx'), null, { year: 2026 }).rows;
+  const all = L.mergeShips(SM.ships, big);
+  assert.equal(all.length, 13 + 5);
+  assert.equal(L.mergeShips(all, big).length, 18);                       // 같은 파일을 다시 더해도 늘지 않음
+  const an = L.analyze(big, sampleFiles(), readingsFor(['text']), [], S0, '2026-11-10');
+  const r = an.rows.find(x => x.ship.hogi === '314501');
+  assert.deepEqual([r.status, r.how], ['pass', 'model']);
+  assert.match(r.notes.join(), /모델 이름이 조금 다름/);
+  assert.deepEqual([L.nearModelName('MODEL-A100L', 'MODEL-A100'), L.nearModelName('A1', 'A12'), L.nearModelName('MODEL-A100', 'MODEL-B200')], [true, false, false]);
+});
+await test('한 PDF 에 여러 쪽(답 ④) — 쪽마다 검사표 · 열쇠는 1쪽 「파일id」 · 2쪽 「파일id#2」, 「검사표 아님」 으로 뺀 쪽은 셈하지 않음', () => {
+  assert.deepEqual([L.sheetKey('f', 1), L.sheetKey('f', 2), L.sheetKey('f')], ['f', 'f#2', 'f']);
+  assert.deepEqual(L.sheetPages({ pages: 3, skip: { 2: true } }), [1, 3]);
+  const files = [{ id: 'f', name: '9월08일~9월23일 작업.pdf', pages: 3 }];
+  const items = [{ no: '1', label: '10±1' }];
+  const rd = (hogi, v) => ({ meta: { model: 'M-1', process: '가공' }, items, hogis: [{ no: hogi, values: { '1': v } }], done: true, at: 'x' });
+  const b = L.buildUnits(files, { f: rd('100', '10'), 'f#2': rd('101', '10'), 'f#3': rd('102', '13') }, {});
+  assert.deepEqual(b.units.map(u => [u.sheet, u.page, u.hogi]), [['f', 1, '100'], ['f#2', 2, '101'], ['f#3', 3, '102']]);
+  const an = L.analyze([{ date: '2026-11-11', model: 'M-1', hogi: '102' }], files, { f: rd('100', '10'), 'f#3': rd('102', '13') }, [], S0, '2026-11-10');
+  assert.deepEqual([an.rows[0].status, an.fails[0].file], ['fail', '9월08일~9월23일 작업.pdf · 3쪽']);
+  assert.equal(L.buildUnits([{ id: 'f', name: 'a.pdf', pages: 3, skip: { 2: true, 3: true } }], {}, {}).ids.length, 1);
+});
+await test('같은 호기 · 다른 공정 검사표는 모두 봄 — 하나라도 불합격이면 불합격, 하나라도 판독 전이면 미판정, 같은 공정은 나중 것', () => {
+  const items = [{ no: '1', label: '10±1' }];
+  const rd = (proc, v, at, done) => ({ meta: { model: 'M-1', process: proc }, items, hogis: [{ no: '7', values: { '1': v } }], done: done !== false, at });
+  const files = ['a', 'b', 'c'].map(id => ({ id, name: id + '.pdf' }));
+  const ship = [{ date: '2026-11-11', model: 'M-1', hogi: '7' }];
+  const run = (rs) => L.analyze(ship, files, rs, [], S0, '2026-11-10').rows[0];
+  assert.equal(run({ a: rd('제작', '10', '1'), b: rd('도장', '10', '1') }).status, 'pass');
+  assert.equal(run({ a: rd('제작', '10', '1'), b: rd('도장', '13', '1') }).status, 'fail');
+  assert.equal(run({ a: rd('제작', '10', '1'), b: rd('도장', '10', '1', false) }).status, 'wait');
+  assert.equal(run({ a: rd('제작', '13', '1'), b: rd('제작', '10', '2'), c: rd('도장', '10', '1') }).status, 'pass');   // 제작 재검사(나중 것)가 합격
+  assert.match(run({ a: rd('제작', '10', '1'), b: rd('도장', '13', '1') }).notes.join(), /공정 2개 검사표를 모두 봄/);
+});
+await test('가릴 영역(추가 요청) — 파일(쪽)별 > 공정별 > 모든 검사표, 빈 배열도 「가리지 않음」 으로 존중 · 옛 자료는 빈 칸으로 읽힘', () => {
+  const all = [{ x: 0.1, y: 0.1, w: 0.1, h: 0.1 }], proc = [{ x: 0.5, y: 0.1, w: 0.2, h: 0.1 }], own = [{ x: 0.7, y: 0.7, w: 0.1, h: 0.1 }];
+  const d = { masks: all, maskProcs: { [L.procKey('시트 부착')]: proc }, maskSheets: { 'f#2': own, g: [] } };
+  assert.deepEqual([L.masksFor(d, 'f', 'ASSY 검사').src, L.masksFor(d, 'f', '시트  부착').src, L.masksFor(d, 'f#2', '시트 부착').src, L.masksFor(d, 'g', '').src], ['all', 'process', 'sheet', 'sheet']);
+  assert.equal(L.masksFor(d, 'f', '시트 부착').masks, proc);
+  assert.equal(L.masksFor(d, 'g', '').masks.length, 0);
+  const r = L.restoreDb({ v: 2, masks: all, maskProcs: { a: [{ x: 1, y: 1, w: 1, h: 1 }, { x: 'z' }], b: 'x' }, maskSheets: { s: own } });
+  assert.deepEqual([r.maskProcs.a.length, 'b' in r.maskProcs, r.maskSheets.s.length], [1, false, 1]);
+  const old = L.restoreDb({ v: 2, masks: all, ships: [], files: [] });     // 2차(10-28) 자료 — 새 칸이 없음
+  assert.deepEqual([old.masks.length, old.maskProcs, old.maskSheets, L.masksFor(old, 'f', '시트 부착').src], [1, {}, {}, 'all']);
+});
+await test('돌아간 쪽(추가 요청) — 글자 방향으로 돌릴 각도를 알아내고(0 · 90 · 180 · 270), 돌려 옮긴 글자 층을 똑같이 읽음', async () => {
+  const T = (a, b, c, d) => ({ str: '가나다', transform: [a, b, c, d, 0, 0] });
+  assert.deepEqual([L.textRotation([T(9, 0, 0, 9)]), L.textRotation([T(0, 9, -9, 0)]), L.textRotation([T(-9, 0, 0, -9)]), L.textRotation([T(0, -9, 9, 0)]), L.textRotation([])], [0, 90, 180, 270, 0]);
+  assert.deepEqual([L.normRot(-90), L.normRot(450), L.normRot(180)], [270, 90, 180]);
+  // 글자 층 샘플을 시계 반대 90° 로 누인 쪽(세로)으로 만들고 → 90° 돌려 읽으면 원래와 같은 결과
+  const name = SM.files.find(f => f.kind === 'text').name;
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(Buffer.from(Pdfs[name], 'base64')), isEvalSupported: false, verbosity: 0 }).promise;
+  const pg = await doc.getPage(1), vp = pg.getViewport({ scale: 1 }), raw = (await pg.getTextContent()).items;
+  const Hh = vp.height;
+  const lying = raw.map(t => { const m = t.transform; return Object.assign({}, t, { transform: [-m[1], m[0], -m[3], m[2], Hh - m[5], m[4]] }); });
+  assert.equal(L.textRotation(lying), 90);
+  const vp90 = pg.getViewport({ scale: 1, rotation: 90 });
+  assert.deepEqual(Array.from(vp90.transform).map(x => Math.round(x * 1000) / 1000), [0, 1, 1, 0, 0, 0]);   // 누운 세로 쪽을 90° 돌린 화면 행렬과 같은 모양
+  const want = L.parseSheetText(L.normTextItems(raw, Hh));
+  const got = L.parseSheetText(L.normTextItems(L.viewportTextItems(lying, [0, 1, 1, 0, 0, 0], Hh), Hh));
+  assert.deepEqual([got.meta, got.items, got.hogis], [want.meta, want.items, want.hogis]);
+  const same = L.parseSheetText(L.normTextItems(L.viewportTextItems(raw, vp.transform, Hh), Hh));   // 돌리지 않은 쪽은 그대로
+  assert.deepEqual(same.hogis, want.hogis);
+});
+
 console.log('샘플 · 저장 · 리포');
-await test('샘플 PDF 6장 — base64 가 PDF 이고 크기 · 내용이 samples/ 파일과 같음', () => {
-  assert.equal(SM.files.length, 6);
+await test('샘플 PDF 7장 — base64 가 PDF 이고 크기 · 내용이 samples/ 파일과 같음', () => {
+  assert.equal(SM.files.length, 7);
   SM.files.forEach(f => {
     const b = Buffer.from(Pdfs[f.name], 'base64');
     assert.equal(b.slice(0, 5).toString(), '%PDF-', f.name);

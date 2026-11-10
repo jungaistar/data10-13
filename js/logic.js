@@ -14,7 +14,7 @@
   'use strict';
   /* 판(版) — index.html 의 ?v= · app.js 의 APP_VERSION 과 같아야 합니다(scripts/bump-version.mjs 로 함께 올림).
      브라우저가 옛 logic.js 와 새 app.js 를 섞어 쓰면 app.js 가 이 값을 보고 계산을 멈춥니다. */
-  var VERSION = '2026-10-28.1';
+  var VERSION = '2026-11-10.1';
 
   // ── 작은 도구 ─────────────────────────────────────────────
   function str(v) { return v == null ? '' : String(v).trim(); }
@@ -90,7 +90,7 @@
 
   // ── 엑셀 머리행·열 찾기 ───────────────────────────────────
   var SHIP_FIELDS = [
-    { id: 'date', label: '출하일', req: true, al: ['출하일', '출하예정일', '출하일자', '출하계획일', '납기', '납기일', '납품일', '일자', '날짜', 'date'] },
+    { id: 'date', label: '출하일', req: true, al: ['출하일', '출하예정일', '출하예정', '출하일자', '출하계획일', '출하계획', '출고예정일', '출고예정', '출고일', '납기', '납기일', '납품일', '일자', '날짜', 'date'] },
     { id: 'model', label: '모델', req: false, al: ['모델', '모델명', '기종', '차종', 'model'] },
     { id: 'part', label: '품번', req: false, al: ['품번', '품목코드', '품목번호', '제품코드', '부품번호', 'partno', 'part', 'pn', '자재코드'] },
     { id: 'hogi', label: '호기', req: true, al: ['호기', '호기수', '호기번호', '기번', '시리얼', '시리얼번호', '제조번호', 'serial', 'sn', 'serialno'] },
@@ -158,19 +158,25 @@
   function splitModels(v) { return halfWidth(str(v)).split(/\s*[\/,，、]\s*/).map(str).filter(Boolean); }
 
   /* 출하일정 aoa → { rows, warnings, det } */
-  function parseShip(aoa, override) {
+  /* opts.year — 「8/10」 처럼 연도 없이 적힌 출하일에 붙일 연도(기준일의 연도). 초대형 출하일정 엑셀은 연도 없이 「월/일」만 적습니다(2026-11-10 답 ③). */
+  function parseShip(aoa, override, opts) {
+    opts = opts || {};
     var det = detectColumns(aoa, SHIP_FIELDS);
     applyOverride(det, override, SHIP_FIELDS);
     var rows = [], warnings = [];
     if (det.headerRow < 0) return { rows: rows, warnings: [{ row: 0, msg: '머리행(출하일 · 호기 칸)을 찾지 못했습니다.' }], det: det };
     if (det.map.part == null && det.map.model == null) warnings.push({ row: 0, msg: '품번 · 모델 칸이 둘 다 없습니다. 하나는 있어야 검사표와 짝지을 수 있습니다.' });
-    var refYear = 0;
+    var baseYear = +opts.year > 1990 ? +opts.year : 0, refYear = baseYear, noYear = 0;
     for (var r = det.headerRow + 1; r < aoa.length; r++) {
       var row = aoa[r] || [];
       if (!row.some(function (v) { return str(v) !== ''; }) || isTotalRow(row)) continue;
+      // 두 줄 머리(「하부」 아래 「Center · Side」)처럼 출하일 · 모델 · 품번 · 호기가 모두 빈 줄은 조용히 건너뜀
+      if (['date', 'model', 'part', 'hogi'].every(function (k) { return str(cell(row, det.map, k)) === ''; })) continue;
       var part = str(cell(row, det.map, 'part')), model = str(cell(row, det.map, 'model'));
-      var date = toDate(cell(row, det.map, 'date'), refYear);
-      if (date) refYear = +date.slice(0, 4);
+      var rawDate = cell(row, det.map, 'date');
+      var date = toDate(rawDate, refYear);
+      if (date && !toDate(rawDate)) noYear++;                     // 연도 없이 적혀 기준 연도를 붙인 날짜
+      else if (date) refYear = +date.slice(0, 4);
       var hogis = splitHogi(cell(row, det.map, 'hogi'));
       if (!part && !model) { warnings.push({ row: r + 1, msg: '품번 · 모델이 비어 건너뜁니다.' }); continue; }
       if (!hogis.length) { warnings.push({ row: r + 1, msg: '호기가 비어 건너뜁니다(호기가 있어야 검사표와 짝지을 수 있습니다).' }); continue; }
@@ -180,6 +186,7 @@
         rows.push({ date: date, model: model, part: part, hogi: hg, qty: hogis.length > 1 ? 1 : (q.ok ? q.value : null), name: str(cell(row, det.map, 'name')), row: r + 1 });
       });
     }
+    if (noYear) warnings.unshift({ row: 0, msg: '연도 없이 「월/일」로 적힌 출하일 ' + noYear + '줄은 ' + refYear + '년으로 봤습니다(기준일의 연도).' });
     var seen = {}, uniq = [];
     rows.forEach(function (x) {
       var k = (x.part ? 'p:' + key(x.part) : 'm:' + key(x.model)) + '|' + key(x.hogi);
@@ -213,7 +220,8 @@
   /* 덮어쓰기 한 줄 정리 — 기준값±공차, 또는 기준값 칸에 「420±1」 같은 규격 글자만 있어도 하한·상한을 계산합니다 */
   function cleanSpec(p) {
     var sp = { part: str(p.part), item: str(p.item), lower: null, upper: null, unit: str(p.unit), kind: 'num', error: '' };
-    if (/^(ok|okng|육안|외관|유무|합불)/.test(key(p.kind))) sp.kind = 'okng';
+    if (/^(부착|풍선|attach)/.test(key(p.kind))) sp.kind = 'attach';
+    else if (/^(ok|okng|육안|외관|유무|합불)/.test(key(p.kind))) sp.kind = 'okng';
     var lo = parseNumber(p.lower), hi = parseNumber(p.upper), no = parseNumber(p.nominal);
     var tol = parseNumber(halfWidth(str(p.tol)).replace(/^±/, ''));
     if (lo.ok) sp.lower = lo.value;
@@ -235,6 +243,7 @@
   function specText(s) {
     if (!s) return '-';
     if (s.kind === 'okng') return '육안 OK/NG';
+    if (s.kind === 'attach') return '부착 확인(풍선 체크)';
     var u = s.unit ? ' ' + s.unit : '';
     if (s.lower != null && s.upper != null) return fmtNum(s.lower) + ' ~ ' + fmtNum(s.upper) + u;
     if (s.lower != null) return fmtNum(s.lower) + u + ' 이상';
@@ -273,12 +282,12 @@
       var a = toN(m[1]), b = toN(m[3]);
       return done(Math.min(a, b), Math.max(a, b), null, m[4] || m[2]);
     }
-    // 4) 상한만 — MAX 1.5 · 1.5 MAX · 최대 1.5 · 1.5 이하
-    if ((m = new RegExp('(?:max|최대)\\.?\\s*:?\\s*' + NUM_RE + UNIT_RE, 'i').exec(s)) || (m = new RegExp(NUM_RE + UNIT_RE + '\\s*(?:max|최대|이하)', 'i').exec(s))) {
+    // 4) 상한만 — MAX 1.5 · 1.5 MAX · 최대 1.5 · 1.5 이하 · 2↓(진직도2↓)
+    if ((m = new RegExp('(?:max|최대)\\.?\\s*:?\\s*' + NUM_RE + UNIT_RE, 'i').exec(s)) || (m = new RegExp(NUM_RE + UNIT_RE + '\\s*(?:max|최대|이하|↓)', 'i').exec(s))) {
       return done(null, toN(m[1]), null, m[2]);
     }
-    // 5) 하한만 — MIN 40 · 40 MIN · 최소 40 · 40 이상
-    if ((m = new RegExp('(?:min|최소)\\.?\\s*:?\\s*' + NUM_RE + UNIT_RE, 'i').exec(s)) || (m = new RegExp(NUM_RE + UNIT_RE + '\\s*(?:min|최소|이상)', 'i').exec(s))) {
+    // 5) 하한만 — MIN 40 · 40 MIN · 최소 40 · 40 이상 · 80㎛↑(도막 두께 80㎛↑ 관리)
+    if ((m = new RegExp('(?:min|최소)\\.?\\s*:?\\s*' + NUM_RE + UNIT_RE, 'i').exec(s)) || (m = new RegExp(NUM_RE + UNIT_RE + '\\s*(?:min|최소|이상|↑)', 'i').exec(s))) {
       return done(toN(m[1]), null, null, m[2]);
     }
     return out;
@@ -324,8 +333,9 @@
   function judgeItem(spec, raw, settings) {
     var S = cleanSettings(settings);
     var p = parseNumber(raw);
-    var r = { status: 'unread', value: null, msg: '', near: false, side: '', raw: p.raw, check: false };
+    var r = { status: 'unread', value: null, msg: '', near: false, side: '', raw: p.raw, check: false, okMark: false };
     if (p.blank || (p.raw.trim() === '' && !p.okng)) { r.status = 'blank'; r.msg = '빈 칸'; return r; }
+    if (spec.kind === 'attach') return judgeAttach(p, r);
     if (p.check) {
       r.check = true;
       if (spec.kind === 'okng' || S.checkAs === 'pass') { r.status = 'pass'; r.value = '체크'; r.msg = spec.kind === 'okng' ? '' : '체크만(값 없음)'; return r; }
@@ -336,9 +346,9 @@
       r.msg = 'OK/NG 로 읽지 못함'; return r;
     }
     if (p.okng) {
+      // 측정값 칸에는 실측값 또는 OK 를 적습니다(2026-11-10 답 ①) — OK 는 검사자가 공차 안을 확인했다는 표시라 합격
       if (p.okng === 'NG') { r.status = 'fail'; r.value = 'NG'; r.msg = 'NG 로 적힘'; return r; }
-      if (S.checkAs === 'pass') { r.status = 'pass'; r.value = 'OK'; r.check = true; r.msg = 'OK 만(값 없음)'; return r; }
-      r.msg = '수치 항목인데 OK 만 적힘'; return r;
+      r.status = 'pass'; r.value = 'OK'; r.okMark = true; r.msg = 'OK 기입(실측값 대신)'; return r;
     }
     if (!p.ok) { r.msg = '숫자로 읽지 못함'; return r; }
     var v = p.value;
@@ -363,17 +373,34 @@
     return r;
   }
 
+  /* 시트 공정 체크시트 — 모델링 뷰의 풍선마다 시트 부착을 확인하고 체크합니다(2026-11-10 답 ①).
+     칸 값: OK · V · ✓ · 「전부」 = 모든 풍선 체크(합격) / NG · 누락 · 미부착 = 불합격 / 「체크 수/풍선 수」(57/58) = 같으면 합격, 모자라면 불합격 */
+  function judgeAttach(p, r) {
+    var s = halfWidth(str(p.raw)).replace(/\s+/g, '');
+    var m = /^(\d+)\/(\d+)$/.exec(s);
+    if (m) {
+      var a = +m[1], b = +m[2];
+      if (!b || a > b) { r.msg = '「체크 수/풍선 수」로 읽지 못함'; return r; }
+      r.value = a + '/' + b;
+      if (a === b) { r.status = 'pass'; r.msg = '풍선 ' + b + '개 모두 체크'; return r; }
+      r.status = 'fail'; r.side = 'low'; r.msg = '풍선 ' + b + '개 중 ' + (b - a) + '개 체크 없음(시트 미부착 확인)'; return r;
+    }
+    if (p.check || p.okng === 'OK' || /^(전부|모두|이상없음|부착|양호)$/.test(s)) { r.status = 'pass'; r.value = 'OK'; r.check = !!p.check; r.msg = '부착 확인'; return r; }
+    if (p.okng === 'NG' || /^(누락|미부착|미체크|없음)$/.test(s)) { r.status = 'fail'; r.value = 'NG'; r.msg = '시트 미부착 · 체크 누락'; return r; }
+    r.msg = 'OK / NG 또는 「체크 수/풍선 수」로 적어 주세요'; return r;
+  }
+
   // ── 검사표 양식 ───────────────────────────────────────────
   /* 「자주 검사 CHECK SHEET」 (10장 ① 첨부 양식) — 머리 칸과 항목 표 칸 이름. 실제 값(모델·품번 등)은 리포에 두지 않습니다. */
   var TEMPLATE = {
     id: 'self-check', name: '자주 검사 CHECK SHEET',
     header: [
-      { id: 'date', label: '작성일', al: ['작성일', '작성일자', '검사일'] },
-      { id: 'process', label: '제작 공정명', al: ['제작공정명', '공정명'] },
-      { id: 'model', label: '모델명', al: ['모델명', '모델'] },
-      { id: 'part', label: '품번', al: ['품번'] },
-      { id: 'name', label: '품명', al: ['품명'] },
-      { id: 'mgmt', label: '관리 번호', al: ['관리번호'] }
+      { id: 'date', label: '작성일', al: ['작성일', '작성일자', '검사일', '검사일자'] },
+      { id: 'process', label: '제작 공정명', al: ['제작공정명', '공정명', '공정'] },
+      { id: 'model', label: '모델명', al: ['모델명', '모델', 'model', '검사모델'] },
+      { id: 'part', label: '품번', al: ['품번', 'p/no', 'pno', 'partno'] },
+      { id: 'name', label: '품명', al: ['품명', 'partname'] },
+      { id: 'mgmt', label: '관리 번호', al: ['관리번호', 'c/no', 'cno'] }
     ],
     subs: ['LH', 'RH', 'FR', 'RE', '좌', '우', '전', '후', '상', '하']
   };
@@ -395,7 +422,8 @@
     var o = { no: str(it && it.no) || String(i + 1), label: str(it && it.label), tool: str(it && it.tool), subs: [], kind: '' };
     var subs = Array.isArray(it && it.subs) ? it.subs : String((it && it.subs) || '').split(/[,\/\s]+/);
     subs.forEach(function (s) { s = str(s).toUpperCase(); if (s && o.subs.indexOf(s) < 0) o.subs.push(s); });
-    o.kind = it && (it.kind === 'okng' || it.kind === 'num') ? it.kind
+    o.kind = it && (it.kind === 'okng' || it.kind === 'num' || it.kind === 'attach') ? it.kind
+      : /풍선|시트\s*부착|부착\s*(확인|유무)/.test(o.label) ? 'attach'
       : (!parseSpecString(o.label).ok && (/육안/.test(o.tool) || /외관|육안|방향|유무/.test(o.label))) ? 'okng' : 'num';
     return o;
   }
@@ -539,13 +567,24 @@
     return { parts: parts, models: models, hogis: hogis };
   }
   function isDone(r) { return !!(r && r.done === true); }
-  /* 파일마다 식별 결과와, 호기 단위 검사 기록(unit)을 만듭니다.
+  /* 검사표 한 장 = PDF 의 한 쪽. 한 PDF 에 공정 · 호기가 여러 쪽으로 들어오기도 합니다(2026-11-10 답 ④ — 「가공 1~10호기」 · 「제작 + 시트 합본」).
+     판독 기록 열쇠: 1쪽은 파일 id 그대로(2차 자료와 같음), 2쪽부터 「파일id#2」. */
+  function sheetKey(fid, page) { return +page > 1 ? fid + '#' + (+page) : fid; }
+  function pagesOf(f) { var n = +(f && f.pages); return n >= 1 ? Math.min(n, 200) : 1; }
+  /* 파일의 쪽 목록 — 「검사표 아님」으로 뺀 쪽은 빼고 */
+  function sheetPages(f) {
+    var out = [];
+    for (var p = 1; p <= pagesOf(f); p++) if (!(f.skip && f.skip[p])) out.push(p);
+    return out;
+  }
+  /* 검사표(쪽)마다 식별 결과와, 호기 단위 검사 기록(unit)을 만듭니다.
      src: 'content' = 검사표 내용(글자 층 · AI · 사람이 검사표를 보고 적음), 'filename' = 파일 이름 힌트(확인 필요) */
   function buildUnits(files, readings, known) {
     readings = readings || {};
     var units = [], ids = [];
-    (files || []).forEach(function (f) {
-      var rd = readings[f.id] || null, hint = hintFromName(f.name, known);
+    (files || []).forEach(function (f) { sheetPages(f).forEach(function (pg) {
+      var sk = sheetKey(f.id, pg);
+      var rd = readings[sk] || null, hint = hintFromName(f.name, known);
       var meta = {}, src = {};
       META_IDS.forEach(function (k) {
         var v = rd && rd.meta ? str(rd.meta[k]) : '';
@@ -561,16 +600,18 @@
       var missing = [];
       if (!(meta.part || meta.model)) missing.push('품번 · 모델');
       if (!hg.length) missing.push('호기');
-      var info = { file: f, reading: rd, meta: meta, src: src, hogiSrc: hogiSrc, hogis: hg.map(function (x) { return str(x.no); }), status: status, missing: missing, done: isDone(rd), auto: rd ? rd.auto || '' : '' };
+      var info = { file: f, page: pg, key: sk, pages: pagesOf(f), reading: rd, meta: meta, src: src, hogiSrc: hogiSrc, hogis: hg.map(function (x) { return str(x.no); }), status: status, missing: missing, done: isDone(rd), auto: rd ? rd.auto || '' : '' };
       ids.push(info);
       hg.forEach(function (x, i) {
-        units.push({ id: f.id + '|' + i, fileId: f.id, file: f, hogi: str(x.no).replace(/^#/, ''), meta: meta, idStatus: status,
+        units.push({ id: sk + '|' + i, fileId: f.id, sheet: sk, page: pg, file: f, hogi: str(x.no).replace(/^#/, ''), meta: meta, idStatus: status,
           items: rd && Array.isArray(rd.items) ? rd.items : [], values: x.values || {}, problems: rd && rd.problems || {},
           done: isDone(rd), by: rd ? rd.by || '' : '', at: rd ? rd.at || '' : '' });
       });
-    });
+    }); });
     return { units: units, ids: ids };
   }
+  /* 검사표 이름 — 「파일.pdf」, 여러 쪽이면 「파일.pdf · 2쪽」 */
+  function sheetLabel(f, page) { return f.name + (pagesOf(f) > 1 ? ' · ' + page + '쪽' : ''); }
 
   // ── 호기 판정 ─────────────────────────────────────────────
   /* 항목 규격 — ① 스펙 덮어쓰기(품번 + 항목 이름 또는 No) ② 검사표에 적힌 규격 글자 ③ 육안이면 OK/NG */
@@ -582,8 +623,8 @@
       if (ki && (ki === key(item.label) || ki === key(item.no) || ki === 'no' + key(item.no))) { o = x; return true; }
       return false;
     });
-    if (o) return { kind: o.kind === 'okng' ? 'okng' : 'num', lower: o.lower, upper: o.upper, unit: o.unit || '', src: 'override' };
-    if (item.kind === 'okng') return { kind: 'okng', lower: null, upper: null, unit: '', src: 'sheet' };
+    if (o) return { kind: o.kind === 'okng' || o.kind === 'attach' ? o.kind : 'num', lower: o.lower, upper: o.upper, unit: o.unit || '', src: 'override' };
+    if (item.kind === 'okng' || item.kind === 'attach') return { kind: item.kind, lower: null, upper: null, unit: '', src: 'sheet' };
     var ps = parseSpecString(item.label);
     return { kind: 'num', lower: ps.lower, upper: ps.upper, unit: ps.unit, src: ps.ok ? 'sheet' : 'none' };
   }
@@ -628,31 +669,53 @@
     var known = knownIds(ships, readings);
     var b = buildUnits(files, readings, known);
     b.units.forEach(function (u) { u.judge = judgeUnit(u, overrides, settings); });
-    var idx = {};
+    var idx = {}, byHogi = {};
     function put(k, u) { (idx[k] = idx[k] || []).push(u); }
     b.units.forEach(function (u) {
       if (!u.hogi) return;
       var kh = key(u.hogi);
+      (byHogi[kh] = byHogi[kh] || []).push(u);
       if (u.meta.part) put('p:' + key(u.meta.part) + '|' + kh, u);
       splitModels(u.meta.model).forEach(function (m) { put('m:' + key(m) + '|' + kh, u); });
     });
     var matched = {};
     var rows = (ships || []).map(function (s) {
-      var kh = key(s.hogi), how = '', cands = [];
-      if (s.part) { cands = idx['p:' + key(s.part) + '|' + kh] || []; how = 'part'; }
+      var kh = key(s.hogi), how = '', cands = [], nearModel = '';
+      if (s.part) {
+        cands = (idx['p:' + key(s.part) + '|' + kh] || []).slice(); how = 'part';
+        // 품번이 맞은 호기가 있으면, 품번 칸이 없는 다른 공정 검사표(시트 등)도 모델 + 호기로 함께 봄
+        if (cands.length && s.model) splitModels(s.model).forEach(function (m) { (idx['m:' + key(m) + '|' + kh] || []).forEach(function (u) { if (!u.meta.part && cands.indexOf(u) < 0) cands.push(u); }); });
+      }
       if (!cands.length && s.model) {
         splitModels(s.model).forEach(function (m) { (idx['m:' + key(m) + '|' + kh] || []).forEach(function (u) { if (cands.indexOf(u) < 0) cands.push(u); }); });
         how = 'model';
+        // 출하일정과 검사표의 모델 이름이 조금 다를 때(뒤에 글자 하나가 더 붙는 등) — 같은 호기이고 한쪽이 다른 쪽으로 시작하면(4글자 이상) 짝
+        if (!cands.length) (byHogi[kh] || []).forEach(function (u) {
+          splitModels(s.model).forEach(function (sm) { splitModels(u.meta.model).forEach(function (um) {
+            if (nearModelName(sm, um) && cands.indexOf(u) < 0) { cands.push(u); nearModel = um; }
+          }); });
+        });
       }
-      var row = { ship: s, unit: null, units: cands, how: cands.length ? how : '', status: 'none', notes: [], days: daysBetween(today, s.date) };
+      var row = { ship: s, unit: null, units: cands, how: cands.length ? how : '', status: 'none', notes: [], days: daysBetween(today, s.date), procs: [] };
       if (!cands.length) return row;
-      var done = cands.filter(function (u) { return u.done; }).sort(function (a, c) { return str(a.at) < str(c.at) ? -1 : 1; });
-      row.unit = done.length ? done[done.length - 1] : cands[0];
-      row.status = row.unit.judge.verdict;
       cands.forEach(function (u) { matched[u.id] = true; });
-      if (cands.length > 1) row.notes.push('같은 호기 검사표 ' + cands.length + '개(가장 나중에 판독한 것으로 판정)');
-      if (how === 'model') row.notes.push(s.part ? '품번으로는 짝이 없어 모델+호기로 짝지음' + (row.unit.meta.part ? '(검사표 품번 ' + row.unit.meta.part + ')' : '') : '모델+호기로 짝지음');
-      if (row.unit.idStatus === 'hint') row.notes.push('파일 이름으로만 식별 — 검사표 내용으로 확인 필요');
+      // 공정마다 검사표가 따로 옵니다(제작 · 시트 · 도장 …) — 같은 공정은 가장 나중에 판독한 것, 공정끼리는 모두 봅니다
+      var groups = {}, order = [];
+      cands.forEach(function (u) { var g = key(u.meta.process); if (!groups[g]) { groups[g] = []; order.push(g); } groups[g].push(u); });
+      var reps = order.map(function (g) {
+        var us = groups[g], done = us.filter(function (u) { return u.done; }).sort(function (a, c) { return str(a.at) < str(c.at) ? -1 : 1; });
+        var pick = done.length ? done[done.length - 1] : us[0];
+        if (us.length > 1) row.notes.push('같은 호기 검사표 ' + us.length + '개(가장 나중에 판독한 것으로 판정)');
+        return pick;
+      });
+      row.procs = reps.map(function (u) { return { process: u.meta.process || '', unit: u, verdict: u.judge.verdict }; });
+      var rank = { fail: 0, wait: 1, hold: 2, pass: 3 };
+      row.unit = reps.slice().sort(function (a, c) { return rank[a.judge.verdict] - rank[c.judge.verdict]; })[0];
+      row.status = row.unit.judge.verdict;
+      if (reps.length > 1) row.notes.push('공정 ' + reps.length + '개 검사표를 모두 봄(' + reps.map(function (u) { return (u.meta.process || '공정 모름') + ' ' + VERDICT_LABEL[u.judge.verdict]; }).join(' · ') + ')');
+      if (how === 'model') row.notes.push(nearModel ? '모델 이름이 조금 다름(출하 ' + s.model + ' · 검사표 ' + nearModel + ') — 앞부분이 같은 모델 + 호기로 짝지음'
+        : s.part ? '품번으로는 짝이 없어 모델+호기로 짝지음' + (row.unit.meta.part ? '(검사표 품번 ' + row.unit.meta.part + ')' : '') : '모델+호기로 짝지음');
+      if (reps.some(function (u) { return u.idStatus === 'hint'; })) row.notes.push('파일 이름으로만 식별 — 검사표 내용으로 확인 필요');
       return row;
     });
     var extra = b.units.filter(function (u) { return !matched[u.id]; });
@@ -662,18 +725,25 @@
     b.units.forEach(function (u) { if (u.judge.verdict === 'fail') counts.unitFail++; });
     counts.undecided = counts.wait + counts.hold;
     var shipOf = {};
-    rows.forEach(function (r) { if (r.unit) shipOf[r.unit.id] = r.ship; });
+    rows.forEach(function (r) { r.units.forEach(function (u) { shipOf[u.id] = r.ship; }); });
     var fails = [];
     b.units.forEach(function (u) {
       if (u.judge.verdict !== 'fail') return;
       var s = shipOf[u.id];
       u.judge.fails.forEach(function (c) {
         fails.push({ shipDate: s ? s.date : '', days: s ? daysBetween(today, s.date) : null, model: u.meta.model || '', part: u.meta.part || '', name: u.meta.name || '', hogi: u.hogi,
-          no: c.no, sub: c.sub, label: c.label, spec: c.spec, raw: c.raw, msg: c.msg, sheetDate: u.meta.date || '', file: u.file.name, problem: str((u.problems || {})[c.no]) });
+          no: c.no, sub: c.sub, label: c.label, spec: c.spec, raw: c.raw, msg: c.msg, sheetDate: u.meta.date || '', file: sheetLabel(u.file, u.page || 1), process: u.meta.process || '', problem: str((u.problems || {})[c.no]) });
       });
     });
     fails.sort(function (a, c) { return (a.shipDate || '9') < (c.shipDate || '9') ? -1 : (a.shipDate || '9') > (c.shipDate || '9') ? 1 : 0; });
     return { ids: b.ids, units: b.units, rows: rows, extra: extra, counts: counts, fails: fails, today: today };
+  }
+  /* 「MODEL-A100L」 과 「MODEL-A100」 — 비교 낱말이 4글자 이상이고 한쪽이 다른 쪽으로 시작하면 가까운 이름 */
+  function nearModelName(a, b) {
+    var x = key(a), y = key(b);
+    if (!x || !y || x === y) return false;
+    var s0 = x.length < y.length ? x : y, l0 = x.length < y.length ? y : x;
+    return s0.length >= 4 && l0.indexOf(s0) === 0 && l0.length - s0.length <= 3;
   }
   /* 출하일 순으로 한 상태만 */
   function shipList(an, statuses) {
@@ -723,7 +793,7 @@
     L.push('');
     if (its.length) {
       L.push('[검사 항목] (칸 이름 = No + 구분)');
-      its.forEach(function (it) { L.push('- ' + it.no + '. ' + (it.label || '(이름 없음)') + (it.tool ? ' · ' + it.tool : '') + (it.subs.length ? ' — 구분 ' + it.subs.join(', ') + ' 줄이 따로 있음' : '') + (it.kind === 'okng' ? ' — 육안(OK 또는 NG)' : '')); });
+      its.forEach(function (it) { L.push('- ' + it.no + '. ' + (it.label || '(이름 없음)') + (it.tool ? ' · ' + it.tool : '') + (it.subs.length ? ' — 구분 ' + it.subs.join(', ') + ' 줄이 따로 있음' : '') + (it.kind === 'okng' ? ' — 육안(OK 또는 NG)' : '') + (it.kind === 'attach' ? ' — 모델링 뷰의 풍선마다 체크 표시가 있는지 세어 「체크 수/풍선 수」(예: 57/58)로, 모두 체크면 "OK"' : '')); });
     } else {
       L.push('[검사 항목] 아직 모르는 양식이야. 표의 No · 검사 항목(규격 글자 그대로, 예: 420±1) · 측정기 · 구분(LH/RH 같은 작은 줄)도 "항목" 에 적어 줘.');
     }
@@ -731,7 +801,9 @@
     L.push('[지켜 줄 것]');
     L.push('- 위쪽 머리 칸(모델명 · 품번 · 품명 · 관리 번호 · 작성일 · 제작 공정명)도 읽어 줘. 모델명에 동그라미 친 것이 있으면 그것만.');
     L.push('- 호기 열마다 하나씩, 호기 번호가 적힌 열만 적어 줘(빈 열은 빼).');
-    L.push('- 칸이 비어 있으면 "", 체크 표시(✓ · V)만 있으면 "✓", 글씨를 알아볼 수 없으면 "?" 로. 추측해서 채우지 마.');
+    L.push('- 칸이 비어 있으면 "", 체크 표시(✓ · V)만 있으면 "✓", 「OK」 라고 적혀 있으면 "OK", 글씨를 알아볼 수 없으면 "?" 로. 추측해서 채우지 마.');
+    if (its.some(function (it) { return it.kind === 'attach'; })) L.push('- 체크가 없는 풍선이 있으면 그 자리(VIEW 이름 등)를 「문제점」 에 적어 줘.');
+    L.push('- 그림이 옆으로 누워 있거나 거꾸로면 바로 세워서 읽어 줘.');
     L.push('- 「문제점(조치사항)」 칸에 적힌 글이 있으면 항목 No 별로 적어 줘.');
     L.push('- 확신이 낮은 칸은 "확신낮음" 목록에 칸 이름(예: "2 LH")을 넣어 줘.');
     L.push('- 검사자 · 결재 칸의 이름 · 서명은 읽지도 적지도 마.');
@@ -846,8 +918,72 @@
     return t;
   }
 
+  // ── 가릴 영역(결재 칸 · 서명) — 모든 검사표 기본 · 공정별 기본 · 파일(쪽)별 ──
+  /* 공정마다 결재 칸 자리가 조금씩 달라(2026-11-10 추가 요청) 세 겹으로 둡니다. 가장 좁은 것이 이깁니다.
+     ① 파일(쪽)별 db.maskSheets[검사표 열쇠] ② 공정별 db.maskProcs[공정명 비교 낱말] ③ 모든 검사표 db.masks
+     비어 있는 배열도 「이 검사표는 가리지 않음」으로 존중합니다. → { masks, src: 'sheet'|'process'|'all', proc } */
+  function procKey(process) { return key(process); }
+  function masksFor(d, sk, process) {
+    d = d || {};
+    if (d.maskSheets && Array.isArray(d.maskSheets[sk])) return { masks: d.maskSheets[sk], src: 'sheet', proc: procKey(process) };
+    var pk = procKey(process);
+    if (pk && d.maskProcs && Array.isArray(d.maskProcs[pk])) return { masks: d.maskProcs[pk], src: 'process', proc: pk };
+    return { masks: Array.isArray(d.masks) ? d.masks : [], src: 'all', proc: pk };
+  }
+  function cleanMasks(arr) { return (Array.isArray(arr) ? arr : []).filter(function (m) { return m && isNum(m.x) && isNum(m.y) && isNum(m.w) && isNum(m.h); }); }
+  function cleanMaskMap(o) {
+    var out = {};
+    if (o && typeof o === 'object') Object.keys(o).forEach(function (k) { if (k && Array.isArray(o[k])) out[k] = cleanMasks(o[k]); });
+    return out;
+  }
+
+  // ── 쪽 방향(90° · 180° 돌아간 스캔) ──────────────────────
+  function normRot(deg) { var r = Math.round((+deg || 0) / 90) * 90 % 360; return r < 0 ? r + 360 : r; }
+  /* 글자 층이 있는 쪽에서 글자가 누운 방향을 보고, 바로 세우려면 시계 방향으로 몇 도 돌려야 하는지(0 · 90 · 180 · 270).
+     items = pdf.js getTextContent().items (transform = [a, b, c, d, x, y]). 글자 수로 가장 많은 방향을 고릅니다.
+     스캔 그림(글자 층 없음)은 여기서 알 수 없습니다 — 화면에서 돌려 주세요. */
+  function textRotation(items) {
+    var w = { 0: 0, 90: 0, 180: 0, 270: 0 };
+    (items || []).forEach(function (t) {
+      var tr = t && t.transform; if (!tr || !str(t.str)) return;
+      var deg = normRot(Math.atan2(tr[1], tr[0]) * 180 / Math.PI);
+      w[deg] += str(t.str).length;
+    });
+    var best = 0;
+    [90, 180, 270].forEach(function (d) { if (w[d] > w[best]) best = d; });
+    return best;
+  }
+  /* 돌린 화면 좌표로 글자 조각 옮기기 — vpTransform = pdf.js viewport.transform, vpHeight = viewport.height.
+     결과는 normTextItems 에 그대로 넣을 수 있는 모양(transform 의 x, y 만 바꿈)입니다. */
+  function viewportTextItems(items, vpTransform, vpHeight) {
+    var m = vpTransform || [1, 0, 0, -1, 0, vpHeight];
+    return (items || []).map(function (t) {
+      var tr = t.transform || [1, 0, 0, 1, 0, 0];
+      var x = m[0] * tr[4] + m[2] * tr[5] + m[4], y = m[1] * tr[4] + m[3] * tr[5] + m[5];
+      var o = {}; for (var k in t) o[k] = t[k];
+      o.transform = [1, 0, 0, 1, x, vpHeight - y];
+      if (!o.height) o.height = Math.sqrt(tr[2] * tr[2] + tr[3] * tr[3]);
+      return o;
+    });
+  }
+
+  // ── 공정별 기본 항목 ─────────────────────────────────────
+  /* 시트 공정 체크시트는 수치 표가 아니라 모델링 뷰의 풍선 체크입니다(2026-11-10 답 ①) — 공정명에 「시트」 · 「SEAT」 가 있으면 이 한 줄로 시작 */
+  function procPreset(process) {
+    if (/시트|seat/i.test(str(process))) return [cleanItem({ no: '1', label: '시트 부착 확인(모델링 뷰 풍선 체크)', tool: '육안', kind: 'attach' }, 0)];
+    return null;
+  }
+  /* 출하일정 합치기 — 소형 · 초대형 · 버켓처럼 파일이 나뉘어 있을 때(2026-11-10 답 ③). 같은 품번(모델) · 호기는 새 것으로 */
+  function mergeShips(oldRows, newRows) {
+    var k = function (x) { return (x.part ? 'p:' + key(x.part) : 'm:' + key(x.model)) + '|' + key(x.hogi); };
+    var seen = {}, out = [];
+    (newRows || []).forEach(function (x) { seen[k(x)] = 1; });
+    (oldRows || []).forEach(function (x) { if (!seen[k(x)]) out.push(x); });
+    return out.concat(newRows || []);
+  }
+
   // ── 저장 데이터 ──────────────────────────────────────────
-  function emptyDb() { return { v: 2, cleared: false, ships: [], shipFile: '', files: [], readings: {}, overrides: [], overrideFile: '', settings: cleanSettings({}), aiNote: '', masks: [], sample: false, refDate: '' }; }
+  function emptyDb() { return { v: 2, cleared: false, ships: [], shipFile: '', files: [], readings: {}, overrides: [], overrideFile: '', settings: cleanSettings({}), aiNote: '', masks: [], maskProcs: {}, maskSheets: {}, sample: false, refDate: '' }; }
   /* 저장 데이터 되살리기. 1단계(v1 — 로트 · 파일 이름 규칙) 자료는 형식이 달라 버리고 legacy 표시만 남깁니다. */
   function restoreDb(o) {
     var d = emptyDb();
@@ -857,7 +993,9 @@
     if (Array.isArray(o.files)) d.files = o.files.filter(function (f) { return f && f.id && f.name; });
     if (o.readings && typeof o.readings === 'object') d.readings = o.readings;
     if (Array.isArray(o.overrides)) d.overrides = o.overrides.filter(function (s) { return s && s.part && s.item; });
-    if (Array.isArray(o.masks)) d.masks = o.masks.filter(function (m) { return m && isNum(m.x) && isNum(m.y) && isNum(m.w) && isNum(m.h); });
+    if (Array.isArray(o.masks)) d.masks = cleanMasks(o.masks);
+    d.maskProcs = cleanMaskMap(o.maskProcs);      // 2026-11-10 추가 — 옛 자료에는 없으니 빈 칸으로
+    d.maskSheets = cleanMaskMap(o.maskSheets);
     d.settings = cleanSettings(o.settings);
     d.cleared = !!o.cleared;
     d.shipFile = str(o.shipFile); d.overrideFile = str(o.overrideFile); d.aiNote = str(o.aiNote); d.sample = !!o.sample;
@@ -873,7 +1011,10 @@
     SHIP_FIELDS: SHIP_FIELDS, SPEC_FIELDS: SPEC_FIELDS, detectColumns: detectColumns, parseShip: parseShip, splitHogi: splitHogi, splitModels: splitModels,
     parseSpec: parseSpec, cleanSpec: cleanSpec, specText: specText, parseSpecString: parseSpecString,
     parseNumber: parseNumber, unitInfo: unitInfo, judgeItem: judgeItem,
-    TEMPLATE: TEMPLATE, META_IDS: META_IDS, cellKey: cellKey, itemCells: itemCells, cleanItem: cleanItem,
+    TEMPLATE: TEMPLATE, META_IDS: META_IDS, cellKey: cellKey, itemCells: itemCells, cleanItem: cleanItem, judgeAttach: judgeAttach,
+    sheetKey: sheetKey, pagesOf: pagesOf, sheetPages: sheetPages, sheetLabel: sheetLabel, nearModelName: nearModelName,
+    procKey: procKey, masksFor: masksFor, cleanMasks: cleanMasks, normRot: normRot, textRotation: textRotation, viewportTextItems: viewportTextItems,
+    procPreset: procPreset, mergeShips: mergeShips,
     normTextItems: normTextItems, parseSheetText: parseSheetText,
     hintFromName: hintFromName, knownIds: knownIds, buildUnits: buildUnits, isDone: isDone,
     resolveSpec: resolveSpec, judgeUnit: judgeUnit, VERDICT_LABEL: VERDICT_LABEL,
