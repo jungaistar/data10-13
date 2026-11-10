@@ -37,6 +37,17 @@ window.AUTH_CONFIG = {
       "판독",
       "호기 판정",
       "출하 대조"
-    ]
+    ],
+    "landing": {
+      "image": "images/landing.jpg",
+      "imageMode": "banner",
+      "imageAlt": "보이지 않던 검사 현황까지 한눈에 — AI가 검사 기록을 분석하고 제품별 검사 진행 상황을 추적합니다",
+      "colors": {
+        "navy": "#0d2a5c",
+        "navy2": "#081d42",
+        "brand": "#1a4fa0",
+        "brandDark": "#123a78"
+      }
+    }
   }
 };
