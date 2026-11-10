@@ -7,7 +7,7 @@
   var L = window.QCLogic, S = window.QCStore, SM = window.QCSample, E = window.AIEndpoint, AIP = window.AIPanel, XLSX = window.XLSX;
   /* 판 맞추기 — 브라우저가 옛 logic.js 와 새 app.js 를 섞어 쓰면(Pages 캐시) 버튼과 결과가 어긋날 수 있어, 섞였으면 계산하지 않고 새로고침을 안내합니다.
      판은 scripts/bump-version.mjs 로 index.html(?v=) · logic.js 와 함께 올립니다. */
-  var APP_VERSION = '2026-11-10.7';
+  var APP_VERSION = '2026-11-10.8';
   if (!L || L.VERSION !== APP_VERSION) {
     var m0 = document.getElementById('main') || document.body;
     m0.innerHTML = '<section class="card" id="versionMismatch"><h1>새 판이 나왔습니다 — 새로고침(Ctrl+F5)해 주세요</h1><p class="alert warn">이 브라우저가 옛 파일과 새 파일을 섞어 불러왔습니다(js/logic.js ' +
@@ -262,11 +262,14 @@
   }
   function parsePending(p) {
     var sh = p.sheets.filter(function (s) { return s.name === p.sheet; })[0];
-    p.result = p.kind === 'ship' ? L.parseShip(sh.aoa, p.override, { year: +refDate().slice(0, 4) }) : L.parseSpec(sh.aoa, p.override);
+    p.result = p.kind === 'ship' ? L.parseShip(sh.aoa, p.override, { year: +refDate().slice(0, 4), only3: p.only3 !== false }) : L.parseSpec(sh.aoa, p.override);
   }
   function startFresh() { db = L.emptyDb(); db.cleared = true; S.clearPdf(); resetCaches(); }
   function pendingCard(p) {
-    var fields = fieldsOf(p.kind), det = p.result.det, hdr = det.header;
+    var fields = p.kind === 'ship' ? L.SHIP_FIELDS.filter(function (f) { return p.only3 === false || ['date', 'model', 'hogi'].indexOf(f.id) >= 0; }) : fieldsOf(p.kind), det = p.result.det, hdr = det.header;
+    // 출하일정은 「모델 · 호기 · 출하예정」 세 칸만(2026-11-10 4차 ③) — 끄면 품번 · 수량 · 품명도 읽음
+    var only3 = h('input', { type: 'checkbox' }); only3.checked = p.only3 !== false;
+    only3.addEventListener('change', function () { p.only3 = only3.checked; p.override = {}; parsePending(p); render(); });
     var sheetSel = h('select', { 'aria-label': '시트' }, p.sheets.map(function (s) { return h('option', { value: s.name, selected: s.name === p.sheet }, s.name); }));
     sheetSel.addEventListener('change', function () { p.sheet = sheetSel.value; p.override = {}; parsePending(p); render(); });
     var grid = h('div', { class: 'map-grid' });
@@ -278,11 +281,13 @@
     });
     var ok = !det.missing.length && p.result.rows.length;
     var preview = p.kind === 'ship'
-      ? table(['출하일', '모델', '품번', '호기', '수량'], p.result.rows.slice(0, 8).map(function (r) { return [r.date || '(날짜 없음)', r.model, r.part, r.hogi, r.qty == null ? '' : r.qty]; }), { nw: [0, 3] })
+      ? (p.only3 !== false ? table(['출하예정', '모델', '호기'], p.result.rows.slice(0, 8).map(function (r) { return [r.date || '(날짜 없음)', r.model, r.hogi]; }), { nw: [0, 2] })
+        : table(['출하일', '모델', '품번', '호기', '수량'], p.result.rows.slice(0, 8).map(function (r) { return [r.date || '(날짜 없음)', r.model, r.part, r.hogi, r.qty == null ? '' : r.qty]; }), { nw: [0, 3] }))
       : table(['품번', '검사 항목(또는 No)', '기준', '방식'], p.result.rows.slice(0, 8).map(function (r) { return [r.part, r.item, L.specText(r), r.kind === 'okng' ? '육안' : '수치']; }));
     return h('section', { class: 'card' },
       h('h2', null, (p.kind === 'ship' ? '출하일정' : '스펙 덮어쓰기 표') + ' 확인 — ' + p.file),
       h('div', { class: 'form-grid' }, fld('시트', sheetSel), h('p', { class: 'note span-all', style: 'margin:0' }, '머리행: ' + (det.headerRow + 1) + '번째 줄 · 읽은 ' + (p.kind === 'ship' ? '호기 ' : '줄 ') + p.result.rows.length + '개')),
+      p.kind === 'ship' ? h('label', { class: 'opt', style: 'margin-top:10px' }, only3, h('span', null, h('span', { class: 't' }, '모델 · 호기 · 출하예정 세 칸만 읽기(권장)'), h('span', { class: 's' }, '소형 · 대형 · 초대형 파일마다 다른 상부 · 하부 · Line · 비고 같은 칸은 읽지도 알리지도 않습니다. 품번 칸으로도 짝지으려면 끄세요.'))) : null,
       h('h3', { style: 'margin-top:14px' }, '열 연결 (자동으로 찾은 것 — 다르면 골라 주세요)'), grid,
       det.missing.length ? h('p', { class: 'alert warn' }, '필수 칸을 찾지 못했습니다: ' + det.missing.join(', ')) : null,
       p.result.warnings.length ? h('details', { class: 'warn-list' }, h('summary', null, '알림 ' + p.result.warnings.length + '건'), h('ul', null, p.result.warnings.slice(0, 60).map(function (w) { return h('li', null, (w.row ? w.row + '행: ' : '') + (w.msg || w)); }))) : null,
@@ -505,9 +510,34 @@
     db.maskSheets = db.maskSheets || {}; db.maskProcs = db.maskProcs || {};
     if (scope === 'all') return db.masks;
     var pk = L.procKey(proc);
-    if (scope === 'process') { if (!pk) return null; if (!Array.isArray(db.maskProcs[pk]) && create) db.maskProcs[pk] = clone(db.masks); return db.maskProcs[pk] || null; }
+    if (scope === 'process') { if (!pk) return null; if (!Array.isArray(db.maskProcs[pk]) && create) db.maskProcs[pk] = clone(L.masksFor(Object.assign({}, db, { maskProcs: {} }), '\u0000', proc).masks); return db.maskProcs[pk] || null; }
     if (!Array.isArray(db.maskSheets[sk]) && create) db.maskSheets[sk] = clone(L.masksFor(db, '\u0000', proc).masks);
     return db.maskSheets[sk] || null;
+  }
+  /* 공정의 가릴 영역 틀 고르기(2026-11-10 4차 ②) — '' = 공정명으로 자동, 'none' = 틀 안 씀(모든 검사표 기본), 그 밖 = 틀 id */
+  function tplSelect(proc) {
+    var pk = L.procKey(proc), cur = pk && db.maskTpl && Object.prototype.hasOwnProperty.call(db.maskTpl, pk) ? db.maskTpl[pk] : '';
+    var auto = L.tplForProcess(proc), autoT = auto ? L.maskTemplate(auto) : null;
+    var sel = h('select', { 'aria-label': '공정 「' + (proc || '') + '」 의 가릴 영역 틀', disabled: !pk },
+      h('option', { value: '', selected: cur === '' }, '자동 — ' + (autoT ? autoT.name : '맞는 틀 없음(모든 검사표 기본)')),
+      L.MASK_TEMPLATES.map(function (t) { return h('option', { value: t.id, selected: cur === t.id }, t.name); }),
+      h('option', { value: 'none', selected: cur === 'none' }, '틀 안 씀 — 모든 검사표 기본'));
+    sel.addEventListener('change', function () {
+      db.maskTpl = db.maskTpl || {};
+      if (sel.value === '') delete db.maskTpl[pk]; else db.maskTpl[pk] = sel.value;
+      save(); render(); toast('공정 「' + proc + '」 의 틀을 바꿨습니다.' + (Array.isArray((db.maskProcs || {})[pk]) ? ' 이 공정에 직접 그린 기본 영역이 있어 그것이 먼저입니다.' : ''));
+    });
+    return sel;
+  }
+  function tplTable() {
+    var procs = [];
+    function add(p) { p = L.str(p); if (p && !procs.some(function (x) { return L.procKey(x) === L.procKey(p); })) procs.push(p); }
+    Object.keys(db.readings).forEach(function (k) { var r = db.readings[k]; if (r && r.meta) add(r.meta.process); });
+    ['가공', 'CHANNEL 평행도 검사', "ASS'Y 검사", '도장', '시트', '각장', '비용접구간'].forEach(add);
+    return table(['공정', '쓰는 틀', '네모'], procs.map(function (p) {
+      var eff = L.masksFor(db, '\u0000', p);
+      return [p, tplSelect(p), eff.src === 'process' ? '직접 그린 공정 기본 ' + eff.masks.length + '곳' : eff.masks.length + '곳(' + eff.masks.map(function (m) { return m.label || '영역'; }).join(' · ') + ')'];
+    }));
   }
   function viewerCard(f, sk, an) {
     var page = ui.page, proc = procOf(sk), eff = masksOf(sk, proc);
@@ -546,7 +576,24 @@
       return h('option', { value: k, selected: ui.maskScope === k, disabled: k === 'process' && !L.procKey(proc) }, SCOPE_LABEL[k] + (k === 'process' ? (proc ? '(' + proc + ')' : '(공정명을 먼저 적어 주세요)') : ''));
     }));
     scopeSel.addEventListener('change', function () { ui.maskScope = scopeSel.value; render(); });
-    var effText = { sheet: '이 파일 · 이 쪽만의 설정', process: '공정 「' + proc + '」 기본', all: '모든 검사표 기본' }[eff.src];
+    var tpl = eff.tpl ? L.maskTemplate(eff.tpl) : null;
+    var effText = { sheet: '이 파일 · 이 쪽만의 설정', process: '공정 「' + proc + '」 기본(직접 그림)', all: '모든 검사표 기본',
+      template: tpl ? '틀 「' + tpl.name + '」' + (eff.auto ? '(공정명 「' + proc + '」 으로 자동)' : '(설정에서 고름)') : '' }[eff.src];
+    // 이 공정의 틀 — 자동(공정명) · 틀 다섯 가지 · 틀 안 씀(모든 검사표 기본). 설정 화면과 같은 값(db.maskTpl)
+    var tplSel = tplSelect(proc);
+    // 글자 층이 있는 쪽 — 「결재 · 검사자 · 확인」 낱말 자리로 영역 짐작(스캔은 글자가 없어 못 함)
+    var guessBtn = (f.pageText || {})[page] !== false ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () {
+      openDoc(f).then(function (pdf) { return pdf.getPage(page); }).then(function (pg) {
+        return pg.getTextContent().then(function (tc) {
+          var turn = L.normRot((pg.rotate || 0) + rotOf(f, page)), vp = pg.getViewport({ scale: 1, rotation: turn });
+          var items = turn ? L.normTextItems(L.viewportTextItems(tc.items, vp.transform, vp.height), vp.height) : L.normTextItems(tc.items, vp.height);
+          var ms = L.masksFromText(items, vp.width, vp.height);
+          if (!ms.length) { toast('이 쪽 글자 층에서 「입안 · 심사 · 결정」 · 「검사자」 · 「확인」 낱말을 찾지 못했습니다. 틀을 쓰거나 직접 그려 주세요.', true); return; }
+          db.maskSheets = db.maskSheets || {}; db.maskSheets[sk] = ms; save(); render();
+          toast('글자 자리로 ' + ms.length + '곳을 짐작해 「이 파일 · 이 쪽만」 에 넣었습니다(' + ms.map(function (m) { return m.label; }).join(' · ') + '). 그림과 맞는지 확인해 주세요.');
+        });
+      }).catch(function (e) { toast('글자 층을 읽지 못했습니다: ' + e.message, true); });
+    } }, '글자 자리로 짐작(이 쪽)') : null;
     return h('section', { class: 'card', style: 'padding:14px' },
       h('div', { class: 'btn-row', style: 'margin-bottom:10px;align-items:center' },
         h('strong', { style: 'margin-right:auto;overflow-wrap:anywhere' }, f.name, ' ', h('span', { class: 'tag' }, kindLabel(f, page))),
@@ -558,11 +605,13 @@
       f.skip && f.skip[page] ? h('p', { class: 'alert warn' }, '이 쪽은 「검사표 아님」으로 빼 두었습니다. 출하 대조 · 결과에서 셈하지 않습니다.') : null,
       ui.drawMask ? h('div', { class: 'alert info mask-help' },
         h('p', { style: 'margin:0 0 6px' }, '검사표 위를 끌어 네모를 그리면 AI 에 보낼 그림에서 그 자리를 흰색으로 덮습니다(결재 칸 · 검사자 서명). 네모의 × 로 뺍니다. 공정마다 결재 칸 자리가 다르면 「이 공정 기본」, 이 PDF 만 다르면 「이 파일 · 이 쪽만」 으로 그려 주세요.'),
-        fld('적용할 범위', scopeSel)) : null,
+        h('div', { class: 'form-grid' }, fld('적용할 범위', scopeSel), fld('이 공정의 틀', tplSel, L.procKey(proc) ? '공정명으로 자동으로 고릅니다. 어긋나면 틀을 바꾸거나, 이 쪽만 고쳐 주세요.' : '공정명을 적으면 틀을 고를 수 있습니다.')),
+        guessBtn ? h('div', { class: 'btn-row', style: 'margin-top:8px' }, guessBtn, h('span', { class: 'note' }, '글자 층이 있는 PDF 만 — 스캔 그림은 틀을 씁니다.')) : null) : null,
       box,
       h('p', { class: 'note', style: 'margin:8px 0 0' }, 'AI 에 보낼 때 가리는 영역 ' + eff.masks.length + '곳 — ' + effText + ' (빨간 점선) ',
         eff.src === 'sheet' ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { delete db.maskSheets[sk]; save(); render(); toast('이 파일 · 쪽의 따로 맞춘 영역을 지웠습니다 — 공정(또는 모든 검사표) 기본을 씁니다.'); } }, '이 파일 조정 지우기(기본으로)') : null,
         eff.src === 'process' ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (!confirm('공정 「' + proc + '」 의 기본 가릴 영역을 지울까요? 같은 공정의 모든 검사표에 적용됩니다.')) return; delete db.maskProcs[L.procKey(proc)]; save(); render(); } }, '공정 기본 지우기') : null,
+        eff.src === 'template' ? h('span', { class: 'note' }, '쪽마다 어긋나면 「가릴 영역 고치기」 → 「이 파일 · 이 쪽만」 으로 맞춰 주세요. ') : null,
         eff.src === 'all' && eff.masks.length ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (!confirm('모든 검사표 기본 가릴 영역을 지울까요?')) return; db.masks = []; save(); render(); } }, '모두 지우기') : null));
   }
   function maskLayer(sk, proc, eff) {
@@ -654,7 +703,7 @@
       if (ui.aiFor === sk) by = 'AI 읽기 + 사람 확인';
       else if (r0.auto === 'text') by = touched ? '글자 층 자동 + 사람 고침' : (r0.by || '글자 층 자동');
       else by = r0.by && r0.by !== '글자 층 자동' ? r0.by : '사람';
-      db.readings[sk] = { meta: d.meta, items: d.items, hogis: d.hogis.filter(function (x, i) { return x.no || Object.keys(x.values || {}).some(function (k) { return x.values[k]; }) || i === 0; }), problems: d.problems,
+      db.readings[sk] = { meta: d.meta, items: d.items, hogis: d.hogis.filter(function (x, i) { return x.no || Object.keys(x.values || {}).some(function (k) { return x.values[k]; }) || i === 0; }), problems: d.problems, specPick: d.specPick || {},
         auto: r0.auto || '', warnings: r0.warnings, by: by, at: nowText(), done: done == null ? !!r0.done : done };
       save();
     }
@@ -677,6 +726,22 @@
       });
       metaGrid.appendChild(h('label', { class: 'field' + (d.src[fd.id] === 'filename' ? ' from-name' : '') }, h('span', null, fd.label, d.src[fd.id] === 'filename' ? h('small', { class: 'hint' }, ' 파일 이름에서 짐작') : null), inp));
     });
+    // 체크한 모델(2026-11-10 4차 ④) — 모델명 칸에 모델이 여럿이거나 모델별 규격이 둘 이상인 항목이 있을 때. 고르면 그 모델의 규격으로 판정
+    d.specPick = d.specPick || {};
+    var multiItems = d.items.map(L.cleanItem).filter(function (it) { return L.modelSpecs(it.label).length; });
+    var mm = L.modelMarks(d.meta.model), modelChoices = mm.models.slice();
+    multiItems.forEach(function (it) { L.modelSpecs(it.label).forEach(function (x) { x.models.forEach(function (m) { if (!modelChoices.some(function (c) { return L.key(c) === L.key(m); })) modelChoices.push(m); }); }); });
+    var curModel = L.unitModel(d.meta);
+    var checkBox = null;
+    if (mm.models.length > 1 || multiItems.length) {
+      var ckSel = h('select', { 'aria-label': '체크한 모델' },
+        h('option', { value: '', selected: !L.str(d.meta.checkModel) }, mm.checked.length === 1 ? '모델명 칸의 체크 — ' + mm.checked[0] : mm.models.length === 1 ? '모델명 칸 — ' + mm.models[0] : '모름(모델별 규격 항목은 보류)'),
+        modelChoices.map(function (m) { return h('option', { value: m, selected: L.key(d.meta.checkModel) === L.key(m) }, m); }));
+      ckSel.addEventListener('change', function () { if (ckSel.value) d.meta.checkModel = ckSel.value; else delete d.meta.checkModel; touched = true; store(); render(); });
+      checkBox = h('div', { class: 'alert ' + (multiItems.length && !curModel ? 'warn' : 'info') + ' model-pick' },
+        h('p', { style: 'margin:0 0 6px' }, '모델명 칸에 체크(✓ · V · ○ · ■)한 모델을 골라 주세요. ', multiItems.length ? '모델별 규격이 둘 이상인 항목 ' + multiItems.length + '개(No ' + multiItems.map(function (x) { return x.no; }).join(', ') + ')는 이 모델의 규격으로 판정하고, 모르면 「보류」 로 둡니다.' : ''),
+        fld('체크한 모델', ckSel, curModel ? '지금 판정에 쓰는 모델: ' + curModel : '모델을 모릅니다'));
+    }
     // 항목 × 호기 표
     var cellsList = L.itemCells(d.items.map(L.cleanItem));
     var hogiInputs = [], valInputs = [], foot = [];
@@ -697,9 +762,17 @@
       var span = (c.item.subs.length || 1);
       var tr = h('tr', { class: first ? 'first' : null });
       if (first) {
-        var sp = L.resolveSpec(c.item, d.meta.part, db.overrides);
+        var sp = L.resolveSpec(c.item, d.meta.part, db.overrides, { model: curModel, pick: d.specPick[c.item.no] });
+        var pickSel = null;
+        if (sp.modelSpecs && sp.src !== 'override') {
+          // 이 항목의 규격을 직접 고르기 — 고르지 않으면 체크한 모델로, 그것도 모르면 보류
+          pickSel = h('select', { class: 'spec-pick', 'aria-label': 'No ' + c.item.no + ' 규격 고르기' },
+            h('option', { value: '', selected: d.specPick[c.item.no] == null }, '체크한 모델로(' + (curModel || '모름 → 보류') + ')'),
+            sp.modelSpecs.map(function (x, xi) { return h('option', { value: String(xi), selected: String(d.specPick[c.item.no]) === String(xi) }, x.label + ': ' + L.specText({ kind: 'num', lower: x.lower, upper: x.upper, unit: x.unit })); }));
+          (function (no, sel) { sel.addEventListener('change', function () { if (sel.value === '') delete d.specPick[no]; else d.specPick[no] = +sel.value; touched = true; store(); render(); }); })(c.item.no, pickSel);
+        }
         tr.appendChild(h('td', { rowspan: span, class: 'no' }, c.item.no));
-        tr.appendChild(h('td', { rowspan: span, class: 'lab' }, h('div', null, c.item.label || '(이름 없음)'), h('small', { class: sp.src === 'none' ? 'bad' : null }, (c.item.tool ? c.item.tool + ' · ' : '') + L.specText(sp) + (sp.src === 'override' ? ' (덮어씀)' : ''))));
+        tr.appendChild(h('td', { rowspan: span, class: 'lab' }, h('div', null, c.item.label || '(이름 없음)'), h('small', { class: sp.src === 'none' || sp.ambiguous ? 'bad' : null }, (c.item.tool ? c.item.tool + ' · ' : '') + L.specText(sp) + (sp.src === 'override' ? ' (덮어씀)' : '')), pickSel));
       }
       tr.appendChild(h('td', { class: 'sub' }, c.sub || ''));
       d.hogis.forEach(function (hg, hi) {
@@ -732,12 +805,12 @@
     function judgeAll() {
       var lines = [];
       d.hogis.forEach(function (hg, hi) {
-        var j = L.judgeUnit({ items: d.items, values: hg.values || {}, meta: d.meta, problems: d.problems, done: true }, db.overrides, db.settings);
+        var j = L.judgeUnit({ items: d.items, values: hg.values || {}, meta: d.meta, problems: d.problems, specPick: d.specPick, done: true }, db.overrides, db.settings);
         var by = {};
         j.cells.forEach(function (x) { by[x.key] = x; });
         valInputs.filter(function (x) { return x.h === hi; }).forEach(function (x) {
           var c = by[x.key], s = c ? c.status : '';
-          x.el.parentNode.className = 'v ' + (s === 'pass' ? (c.near ? 'near' : c.check ? 'chk' : 'pass') : s === 'fail' ? 'fail' : s === 'unread' || s === 'nospec' ? 'hold' : s === 'blank' && L.isDone(rd) ? 'empty' : '');
+          x.el.parentNode.className = 'v ' + (s === 'pass' ? (c.near ? 'near' : c.check ? 'chk' : 'pass') : s === 'fail' ? 'fail' : s === 'unread' || s === 'nospec' || s === 'modelspec' ? 'hold' : s === 'blank' && L.isDone(rd) ? 'empty' : '');
           x.el.title = c ? (c.msg || (s === 'pass' ? '합격' : '')) : '';
         });
         foot[hi].innerHTML = '';
@@ -789,7 +862,7 @@
     }
     var cfgAi = E.load();
     var manualBar = verdict === 'wait' || verdict === 'hold' || !d.items.length ? h('div', { class: 'alert warn manual-bar' },
-      h('p', { style: 'margin:0 0 8px' }, h('b', null, '이 검사표: ' + (verdict === 'hold' ? '보류' : '판독 대기')), verdict === 'hold' ? ' — 빈 칸이나 못 읽은 칸이 있습니다(색이 칠해진 칸).' : ' — 아직 값이 판정에 들어가지 않았습니다.'),
+      h('p', { style: 'margin:0 0 8px' }, h('b', null, '이 검사표: ' + (verdict === 'hold' ? '보류' : '판독 대기')), verdict === 'hold' ? ' — 빈 칸 · 못 읽은 칸 · 모델을 골라야 하는 규격이 있습니다(색이 칠해진 칸).' : ' — 아직 값이 판정에 들어가지 않았습니다.'),
       h('div', { class: 'btn-row' },
         h('button', { type: 'button', class: 'btn btn-primary', onclick: manual }, '수동 판독(직접 입력)'),
         (f.pageText || {})[ui.page] !== false ? h('button', { type: 'button', class: 'btn', onclick: reauto }, '글자 층에서 다시 읽기') : null,
@@ -799,7 +872,7 @@
       manualBar,
       notice,
       info && info.status === 'hint' ? h('p', { class: 'alert warn' }, '노란 칸은 파일 이름에서 짐작한 것입니다. 검사표 머리 칸 · 호기와 같은지 확인해 주세요.') : null,
-      metaGrid, dl, dlm,
+      metaGrid, dl, dlm, checkBox,
       d.items.length ? h('div', { class: 'table-wrap', style: 'margin-top:12px' }, grid) : h('p', { class: 'alert warn' }, '검사 항목이 아직 없습니다. 품번(또는 모델명)을 적으면 같은 품번의 다른 검사표에서 항목을 가져옵니다. 처음 보는 양식이면 아래 「검사 항목 고치기」로 넣거나 AI 로 읽어 주세요.'),
       d.items.length ? detail : null,
       d.items.length ? h('p', { class: 'note', style: 'margin:8px 0' }, '값은 적힌 그대로(단위 · 쉼표도 그대로). 빈 칸은 비워 두고(보류), 알아볼 수 없으면 「?」(확인 필요), 체크만 있으면 「V」, 육안은 OK / NG. Enter 로 아래 칸.') : null,
@@ -969,7 +1042,7 @@
       return [u.meta.date || '', u.meta.model || '', u.meta.part || '', u.meta.name || '', u.meta.mgmt || '', u.hogi, L.VERDICT_LABEL[j.verdict], failText(j), j.blanks.map(function (x) { return x.key; }).join(', '), j.unreads.map(function (x) { return x.key; }).join(', '), j.checks.length, s ? s.date : '', sheetName(u.file, u.page), u.done ? u.by : '', u.done ? u.at : '', u.meta.process || ''];
     }));
     var long = [];
-    an.units.forEach(function (u) { u.judge.cells.forEach(function (c) { long.push([u.meta.part || '', u.meta.model || '', u.hogi, c.no, c.sub, c.label, c.spec, c.raw, c.value == null ? '' : c.value, ({ pass: '합격', fail: '불합격', blank: '빈 칸', unread: '확인 필요', nospec: '규격 없음' })[c.status], c.msg, sheetName(u.file, u.page)]); }); });
+    an.units.forEach(function (u) { u.judge.cells.forEach(function (c) { long.push([u.meta.part || '', u.meta.model || '', u.hogi, c.no, c.sub, c.label, c.spec, c.raw, c.value == null ? '' : c.value, ({ pass: '합격', fail: '불합격', blank: '빈 칸', unread: '확인 필요', nospec: '규격 없음', modelspec: '모델별 규격 — 고르기 필요' })[c.status], c.msg, sheetName(u.file, u.page)]); }); });
     sheet('측정값_전체', ['품번', '모델', '호기', 'No', '구분', '검사 항목', '기준', '적힌 값', '읽은 값', '판정', '내용', '검사표'], long);
     var ship = function (statuses) { return L.shipList(an, statuses).map(function (r) { return [r.ship.date, L.dday(r.days), r.ship.model, r.ship.part, r.ship.hogi, r.ship.qty, L.VERDICT_LABEL[r.status], r.unit ? failText(r.unit.judge) || holdText(r) : '', r.notes.join(' · '), r.unit ? sheetName(r.unit.file, r.unit.page) : '']; }); };
     var sh = ['출하일', '남은 날', '모델', '품번', '호기', '수량', '상태', '내용', '알림', '검사표'];
@@ -1093,6 +1166,10 @@
         } }, '저장'))),
       h('section', { class: 'card' }, h('h2', null, 'AI 에 보낼 그림에서 가리는 영역'),
         h('p', { class: 'note' }, '② 판독 화면의 「가릴 영역 고치기」로 정합니다. 쪽 크기 대비 비율입니다. 세 겹으로 두고 좁은 것이 먼저입니다 — 이 파일 · 쪽만 > 공정 기본 > 모든 검사표 기본. 공정마다 결재 칸 자리가 다르면 공정 기본을, 한 PDF 만 다르면 그 파일에서 따로 맞춰 주세요.'),
+        h('h3', { style: 'margin-top:12px' }, '공정별 틀'),
+        h('p', { class: 'note' }, '공정명으로 틀을 자동으로 고릅니다 — 평행도 · ASSY · 가공 · 제작 · 도장은 ① 제작 · 가공형(결재 · 검사자 · 개정 확인란), 시트 · 각장 · 비용접구간은 ② 상단 결재란 1칸형. 공정마다 바꾸거나 「틀 안 씀」 으로 둘 수 있습니다. 판독 화면에서 그 공정을 직접 그리면(「이 공정 기본」) 그것이 틀보다 먼저입니다.'),
+        tplTable(),
+        h('h3', { style: 'margin-top:12px' }, '설정한 범위'),
         table(['범위', '설정', ''], [
           ['모든 검사표 기본', db.masks.length + '곳', db.masks.length ? h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { if (confirm('모든 검사표 기본 영역을 지울까요?')) { db.masks = []; save(); render(); } } }, '지우기') : '']
         ].concat(Object.keys(db.maskProcs || {}).map(function (k) {

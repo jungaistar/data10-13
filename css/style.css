@@ -410,3 +410,9 @@ pre.prompt { white-space: pre-wrap; background: #fafbfd; border: 1px solid var(-
 .mask .mask-x { position: absolute; right: -11px; top: -11px; width: 24px; height: 24px; min-height: 0; padding: 0; border-radius: 50%; border: 1px solid #b3261e; background: #fff; color: #b3261e; font-weight: 700; line-height: 1; cursor: pointer; }
 .manual-bar .btn-row { margin: 0; }
 table.list.sheet-grid td.v.empty input { border-color: #e0b44a; background: #fffbef; }
+/* 4차(2026-11-10) — 모델별 규격 고르기 · 체크한 모델 · 가릴 영역 틀 */
+table.list.sheet-grid td.lab select.spec-pick { display: block; margin-top: 4px; width: 100%; max-width: 240px; min-height: 30px; font-size: .78rem; }
+.model-pick .field { margin: 0; max-width: 360px; }
+.model-pick select, .mask-help .form-grid select { max-width: 100%; }
+.card table.list td select { max-width: 230px; }
+.mask-help .form-grid { gap: 8px 14px; }

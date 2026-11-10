@@ -14,7 +14,7 @@
   'use strict';
   /* 판(版) — index.html 의 ?v= · app.js 의 APP_VERSION 과 같아야 합니다(scripts/bump-version.mjs 로 함께 올림).
      브라우저가 옛 logic.js 와 새 app.js 를 섞어 쓰면 app.js 가 이 값을 보고 계산을 멈춥니다. */
-  var VERSION = '2026-11-10.7';
+  var VERSION = '2026-11-10.8';
 
   // ── 작은 도구 ─────────────────────────────────────────────
   function str(v) { return v == null ? '' : String(v).trim(); }
@@ -50,7 +50,8 @@
     if ((m = /^(\d{4})(\d{2})(\d{2})$/.exec(s))) return ymd(+m[1], +m[2], +m[3]);
     if ((m = /^(\d{2})(\d{2})(\d{2})$/.exec(s))) return ymd(2000 + +m[1], +m[2], +m[3]);
     if ((m = /^(\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})$/.exec(s))) return ymd(2000 + +m[1], +m[2], +m[3]);
-    if (refYear && (m = /^(\d{1,2})[.\-\/월](\d{1,2})일?$/.exec(s))) return ymd(refYear, +m[1], +m[2]);
+    // 연도 없는 「8/10」 · 「8/10(월)」 · 「8월 10일」 — 출하일정 파일마다 적는 모양이 다릅니다(2026-11-10 4차 ③)
+    if (refYear && (m = /^(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})\s*일?\s*(?:\([^)]*\))?$/.exec(s))) return ymd(refYear, +m[1], +m[2]);
     if (refYear && (m = /^(\d{2})(\d{2})$/.exec(s))) return ymd(refYear, +m[1], +m[2]);
     return '';
   }
@@ -107,9 +108,11 @@
     { id: 'unit', label: '단위', req: false, al: ['단위', 'unit'] },
     { id: 'kind', label: '판정 방식', req: false, al: ['판정방식', '판정', '방식', '구분', 'type'] }
   ];
-  function matchFieldIn(fields, h) {
+  function matchFieldIn(fields, h) { return matchFieldEx(fields, h).id; }
+  /* → { id, exact } — 별칭과 똑같은 머리(exact)가 앞부분만 같은 머리보다 먼저입니다 */
+  function matchFieldEx(fields, h) {
     var k = key(h).replace(/\(.*$/, '');
-    if (!k) return '';
+    if (!k) return { id: '', exact: false };
     var best = '', bestLen = 0;
     fields.forEach(function (f) {
       f.al.forEach(function (a) {
@@ -118,16 +121,17 @@
         else if (k.indexOf(ak) === 0 && ak.length >= 2 && ak.length > bestLen) { best = f.id; bestLen = ak.length; }
       });
     });
-    return best;
+    return { id: best, exact: bestLen >= 100 };
   }
   /* aoa(배열의 배열)에서 머리행 찾기 — 앞 15줄 가운데 필수 칸을 가장 많이 맞춘 줄 */
   function detectColumns(aoa, fields) {
     var best = { headerRow: -1, map: {}, score: 0 };
     for (var r = 0; r < Math.min(15, aoa.length); r++) {
-      var row = aoa[r] || [], map = {}, score = 0;
+      var row = aoa[r] || [], map = {}, score = 0, exact = {};
       for (var c = 0; c < row.length; c++) {
-        var f = matchFieldIn(fields, row[c]);
-        if (f && map[f] == null) { map[f] = c; score += fields.filter(function (x) { return x.id === f; })[0].req ? 3 : 1; }
+        var mf = matchFieldEx(fields, row[c]), f = mf.id;
+        if (f && map[f] == null) { map[f] = c; exact[f] = mf.exact; score += fields.filter(function (x) { return x.id === f; })[0].req ? 3 : 1; }
+        else if (f && mf.exact && !exact[f]) { map[f] = c; exact[f] = true; }   // 「호기수」 보다 뒤에 있는 「호기」 처럼 이름이 똑같은 칸을 씀
       }
       if (score > best.score) best = { headerRow: r, map: map, score: score };
     }
@@ -154,16 +158,47 @@
     }
     return s.split(/[,，、\/;]|\s+/).map(function (x) { return x.replace(/^#/, '').trim(); }).filter(Boolean);
   }
-  /* 모델 칸에 「A / B」 처럼 여럿 적힌 경우 */
-  function splitModels(v) { return halfWidth(str(v)).split(/\s*[\/,，、]\s*/).map(str).filter(Boolean); }
+  /* 모델 칸에 「A / B」 처럼 여럿 적힌 경우 — 체크 표시(✓ · (V) · ○ · ■ …)는 떼고 이름만 */
+  function splitModels(v) { return modelMarks(v).models; }
+  /* 모델명 칸의 체크 표시(2026-11-10 4차 ④) — 「A100 / B200✓ / C300」 · 「□A100 ■B200」 · 「A100(V)」 · 「✓ B200」.
+     → { models: [이름…], checked: [체크한 이름…] }. 「V」 는 이름 속 글자와 헷갈리므로 괄호 「(V)」 · 띄어 쓴 「V」 만 체크로 봅니다.
+     □ ☐ 는 빈 상자(체크 아님)라 떼기만 합니다. */
+  var MARK_ON = '✓✔√☑■●◉○◯▣☒', MARK_OFF = '□☐';
+  function modelMarks(v) {
+    var s = halfWidth(str(v)).replace(/\u2713|\u2714/g, '✓');
+    var out = { models: [], checked: [] };
+    if (!s) return out;
+    s = s.replace(new RegExp('\\s+(?=[' + MARK_ON + MARK_OFF + ']\\s*[^\\s\\/,，、' + MARK_ON + MARK_OFF + '])', 'g'), ' /');   // 「□A100 ■B200」 → 이름 앞 상자에서 나눔(「A100 ✓ / B200」 의 꼬리 체크는 그대로)
+    s.split(/\s*[\/,，、]\s*/).forEach(function (t) {
+      t = str(t); if (!t) return;
+      var on = false;
+      if (new RegExp('[' + MARK_ON + ']').test(t)) on = true;
+      if (/[(\[]\s*[vV✓]\s*[)\]]/.test(t) || /(^|\s)[vV](\s|$)/.test(t)) on = true;
+      var name = t.replace(new RegExp('[' + MARK_ON + MARK_OFF + ']', 'g'), ' ').replace(/[(\[]\s*[vV✓]\s*[)\]]/g, ' ').replace(/(^|\s)[vV](?=\s|$)/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!name) return;
+      out.models.push(name);
+      if (on) out.checked.push(name);
+    });
+    return out;
+  }
+  /* 두 모델 이름이 같은 모델인가 — 같은 비교 낱말, 아니면 가까운 이름(nearModelName) */
+  function sameModel(a, b) { return !!(key(a) && key(a) === key(b)); }
 
   /* 출하일정 aoa → { rows, warnings, det } */
-  /* opts.year — 「8/10」 처럼 연도 없이 적힌 출하일에 붙일 연도(기준일의 연도). 초대형 출하일정 엑셀은 연도 없이 「월/일」만 적습니다(2026-11-10 답 ③). */
+  /* opts.year — 「8/10」 처럼 연도 없이 적힌 출하일에 붙일 연도(기준일의 연도). 초대형 출하일정 엑셀은 연도 없이 「월/일」만 적습니다(2026-11-10 답 ③).
+     opts.only3 — 「모델 · 호기 · 출하예정」 세 칸만 찾아 씁니다(2026-11-10 4차 ③). 소형 · 대형 · 초대형 파일마다 나머지 칸(상부 · 하부 · Line · 품번 · 수량 …)이
+     달라도 읽지도 알리지도 않습니다. 이때 모델은 필수입니다(품번 칸을 보지 않으므로). */
+  var SHIP3 = ['date', 'model', 'hogi'];
+  function shipFields(only3) {
+    if (!only3) return SHIP_FIELDS;
+    return SHIP_FIELDS.filter(function (f) { return SHIP3.indexOf(f.id) >= 0; }).map(function (f) { var o = {}; for (var k in f) o[k] = f[k]; o.req = true; return o; });
+  }
   function parseShip(aoa, override, opts) {
     opts = opts || {};
-    var det = detectColumns(aoa, SHIP_FIELDS);
-    applyOverride(det, override, SHIP_FIELDS);
-    var rows = [], warnings = [];
+    var FL = shipFields(!!opts.only3);
+    var det = detectColumns(aoa, FL);
+    applyOverride(det, override, FL);
+    var rows = [], warnings = [], blankDate = 0;
     if (det.headerRow < 0) return { rows: rows, warnings: [{ row: 0, msg: '머리행(출하일 · 호기 칸)을 찾지 못했습니다.' }], det: det };
     if (det.map.part == null && det.map.model == null) warnings.push({ row: 0, msg: '품번 · 모델 칸이 둘 다 없습니다. 하나는 있어야 검사표와 짝지을 수 있습니다.' });
     var baseYear = +opts.year > 1990 ? +opts.year : 0, refYear = baseYear, noYear = 0;
@@ -180,12 +215,14 @@
       var hogis = splitHogi(cell(row, det.map, 'hogi'));
       if (!part && !model) { warnings.push({ row: r + 1, msg: '품번 · 모델이 비어 건너뜁니다.' }); continue; }
       if (!hogis.length) { warnings.push({ row: r + 1, msg: '호기가 비어 건너뜁니다(호기가 있어야 검사표와 짝지을 수 있습니다).' }); continue; }
-      if (!date) warnings.push({ row: r + 1, msg: '출하일을 읽지 못했습니다(' + str(cell(row, det.map, 'date')) + ').' });
+      if (!date && str(rawDate) === '') blankDate++;                // 출하예정이 아직 빈 줄 — 줄마다 알리지 않고 한 줄로 셈
+      else if (!date) warnings.push({ row: r + 1, msg: '출하일을 읽지 못했습니다(' + str(rawDate) + ').' });
       var q = parseNumber(cell(row, det.map, 'qty'));
       hogis.forEach(function (hg) {
         rows.push({ date: date, model: model, part: part, hogi: hg, qty: hogis.length > 1 ? 1 : (q.ok ? q.value : null), name: str(cell(row, det.map, 'name')), row: r + 1 });
       });
     }
+    if (blankDate) warnings.unshift({ row: 0, msg: '출하예정이 빈 줄 ' + blankDate + '개는 날짜 없이 넣었습니다(호기는 대조함).' });
     if (noYear) warnings.unshift({ row: 0, msg: '연도 없이 「월/일」로 적힌 출하일 ' + noYear + '줄은 ' + refYear + '년으로 봤습니다(기준일의 연도).' });
     var seen = {}, uniq = [];
     rows.forEach(function (x) {
@@ -242,6 +279,8 @@
   }
   function specText(s) {
     if (!s) return '-';
+    if (s.ambiguous) return '모델별 규격 ' + s.modelSpecs.length + '개(' + s.modelSpecs.map(function (x) { return x.label + ' ' + specText({ kind: 'num', lower: x.lower, upper: x.upper, unit: x.unit }); }).join(' / ') + ') — 모델을 골라 주세요';
+    if (s.model) return specText({ kind: s.kind, lower: s.lower, upper: s.upper, unit: s.unit }) + ' (모델 ' + s.model + (s.how === 'pick' ? ' · 사람이 고름' : '') + ')';
     if (s.kind === 'okng') return '육안 OK/NG';
     if (s.kind === 'attach') return '부착 확인(풍선 체크)';
     var u = s.unit ? ' ' + s.unit : '';
@@ -591,6 +630,7 @@
         if (v) { meta[k] = v; src[k] = 'content'; }
         else if (hint[k]) { meta[k] = hint[k]; src[k] = 'filename'; }
       });
+      if (rd && rd.meta && str(rd.meta.checkModel)) meta.checkModel = str(rd.meta.checkModel);   // 체크한 모델(4차 ④)
       var hg = rd && Array.isArray(rd.hogis) ? rd.hogis.filter(function (x) { return x && str(x.no); }) : [];
       var hogiSrc = hg.length ? 'content' : '';
       if (!hg.length && hint.hogi) { hg = [{ no: hint.hogi, values: {} }]; hogiSrc = 'filename'; }
@@ -604,7 +644,7 @@
       ids.push(info);
       hg.forEach(function (x, i) {
         units.push({ id: sk + '|' + i, fileId: f.id, sheet: sk, page: pg, file: f, hogi: str(x.no).replace(/^#/, ''), meta: meta, idStatus: status,
-          items: rd && Array.isArray(rd.items) ? rd.items : [], values: x.values || {}, problems: rd && rd.problems || {},
+          items: rd && Array.isArray(rd.items) ? rd.items : [], values: x.values || {}, problems: rd && rd.problems || {}, specPick: rd && rd.specPick && typeof rd.specPick === 'object' ? rd.specPick : {},
           done: isDone(rd), by: rd ? rd.by || '' : '', at: rd ? rd.at || '' : '' });
       });
     }); });
@@ -613,9 +653,65 @@
   /* 검사표 이름 — 「파일.pdf」, 여러 쪽이면 「파일.pdf · 2쪽」 */
   function sheetLabel(f, page) { return f.name + (pagesOf(f) > 1 ? ' · ' + page + '쪽' : ''); }
 
+  // ── 한 칸에 모델별 규격이 둘 이상(2026-11-10 4차 ④) ───────
+  /* 「LH 상면 높이 MODEL-A100 SPEC:366±2 MODEL-B200 SPEC:363±2」 · 「A100 BR:571±2 / B200/B200H:468±2」
+     → [{ models:[…], label:'MODEL-A100', lower, upper, unit, text }]. 규격 글자가 둘 이상이고 저마다 앞에 모델 이름이 있을 때만(아니면 []).
+     모델 이름 = 규격 바로 앞 글자에서 숫자가 든 마지막 낱말부터 끝까지(「SPEC」 · 「:」 는 뗌). 「B200/B200H」 처럼 빗금이면 둘 다,
+     「E/EHR」 처럼 뒤가 숫자 없이 짧으면 앞 이름의 숫자까지를 붙여(「…E」 → 「…EHR」) 씁니다. */
+  var SPEC_G = new RegExp('(?:' + NUM_RE + '\\s*(?:±|\\+\\s*/\\s*-|\\+\\s*-)\\s*' + NUM_RE +
+    '|' + NUM_RE + '\\s*\\(?\\s*[+-]\\s*' + NUM_RE + '\\s*[/,]?\\s*[+-]\\s*' + NUM_RE + '\\s*\\)?' +
+    '|' + NUM_RE + '\\s*[~∼〜]\\s*' + NUM_RE + ')(?:' + UNIT_RE + '(?![A-Za-z]))?', 'gi');   // 「366±2 MODEL-B」 의 M 을 단위로 먹지 않게
+  function modelSpecs(label) {
+    var s = halfWidth(str(label)).replace(/[−–]/g, '-').replace(/\s+/g, ' ').replace(/[ΦφØø⌀]\s*/g, '');
+    var out = [], last = 0, m;
+    SPEC_G.lastIndex = 0;
+    while ((m = SPEC_G.exec(s))) {
+      var pre = s.slice(last, m.index), ps = parseSpecString(m[0]);
+      last = m.index + m[0].length;
+      if (!ps.ok) continue;
+      pre = pre.replace(/(spec|규격|기준)\s*[:：]?\s*$/i, '').replace(/[:：=\-·,]\s*$/, '').trim();
+      var words = pre.split(' ').filter(Boolean), at = -1;
+      for (var i = words.length - 1; i >= 0; i--) if (/\d/.test(words[i])) { at = i; break; }
+      var name = at >= 0 ? words.slice(at).join(' ') : (words.length ? words[words.length - 1] : '');
+      name = name.replace(/^[\/·,]+|[\/·,]+$/g, '').replace(/(spec|규격)$/i, '').trim();
+      if (!name || SUB_RE.test(name)) { out.push({ models: [], label: '', lower: ps.lower, upper: ps.upper, unit: ps.unit, text: m[0].trim() }); continue; }
+      var ms = [], prev = '';
+      name.split(/\s*\/\s*/).filter(Boolean).forEach(function (t) {
+        if (!/\d/.test(t) && prev && t.length <= 4) { var mm = /^(.*\d)/.exec(prev); if (mm) t = mm[1] + t; }
+        ms.push(t); prev = t;
+      });
+      out.push({ models: ms, label: name, lower: ps.lower, upper: ps.upper, unit: ps.unit, text: m[0].trim() });
+    }
+    if (out.length < 2 || out.some(function (x) { return !x.models.length; })) return [];
+    var distinct = out.filter(function (x, i) { return out.findIndex(function (y) { return y.lower === x.lower && y.upper === x.upper; }) === i; });
+    return distinct.length >= 2 ? out : [];
+  }
+  /* 이 검사표의 모델 — ① 사람 · AI 가 고른 「체크한 모델」 ② 모델명 칸에서 체크 표시가 붙은 하나 ③ 모델이 하나뿐이면 그것. 모르면 '' */
+  function unitModel(meta) {
+    meta = meta || {};
+    var ck = str(meta.checkModel);
+    if (ck && !/^\?+$/.test(ck)) return modelMarks(ck).models[0] || ck;
+    var mm = modelMarks(meta.model);
+    if (mm.checked.length === 1) return mm.checked[0];
+    if (mm.models.length === 1) return mm.models[0];
+    return '';
+  }
+  /* 모델별 규격 가운데 이 모델에 맞는 것 — 같은 이름이 먼저, 없으면 가까운 이름. 규격이 하나로 모이지 않으면 null */
+  function pickModelSpec(ms, model) {
+    if (!model) return null;
+    function uniq(list) { return list.filter(function (x, i) { return list.findIndex(function (y) { return y.lower === x.lower && y.upper === x.upper; }) === i; }); }
+    var ex = uniq(ms.filter(function (x) { return x.models.some(function (m) { return sameModel(m, model); }); }));
+    if (ex.length === 1) return ex[0];
+    if (ex.length > 1) return null;
+    var nr = uniq(ms.filter(function (x) { return x.models.some(function (m) { return nearModelName(m, model); }); }));
+    return nr.length === 1 ? nr[0] : null;
+  }
+
   // ── 호기 판정 ─────────────────────────────────────────────
-  /* 항목 규격 — ① 스펙 덮어쓰기(품번 + 항목 이름 또는 No) ② 검사표에 적힌 규격 글자 ③ 육안이면 OK/NG */
-  function resolveSpec(item, part, overrides) {
+  /* 항목 규격 — ① 스펙 덮어쓰기(품번 + 항목 이름 또는 No) ② 검사표에 적힌 규격 글자 ③ 육안이면 OK/NG
+     ctx = { model: 이 검사표의 모델(unitModel), pick: 사람이 고른 규격 번호 } — 한 칸에 모델별 규격이 둘 이상이면 이것으로 고르고,
+     못 고르면 { ambiguous: true } 로 돌려 그 칸을 「보류」 로 둡니다(2026-11-10 4차 ④ — 예전에는 첫 규격만 읽음). */
+  function resolveSpec(item, part, overrides, ctx) {
     var kp = key(part), o = null;
     (overrides || []).some(function (x) {
       if (!x || key(x.part) !== kp) return false;
@@ -625,6 +721,15 @@
     });
     if (o) return { kind: o.kind === 'okng' || o.kind === 'attach' ? o.kind : 'num', lower: o.lower, upper: o.upper, unit: o.unit || '', src: 'override' };
     if (item.kind === 'okng' || item.kind === 'attach') return { kind: item.kind, lower: null, upper: null, unit: '', src: 'sheet' };
+    var ms = modelSpecs(item.label);
+    if (ms.length) {
+      ctx = ctx || {};
+      var hit = null, how = '';
+      if (ctx.pick != null && ctx.pick !== '' && ms[+ctx.pick]) { hit = ms[+ctx.pick]; how = 'pick'; }
+      else if ((hit = pickModelSpec(ms, ctx.model))) how = 'model';
+      if (hit) return { kind: 'num', lower: hit.lower, upper: hit.upper, unit: hit.unit, src: 'sheet', model: hit.label, how: how, modelSpecs: ms };
+      return { kind: 'num', lower: null, upper: null, unit: '', src: 'model', ambiguous: true, modelSpecs: ms, forModel: str(ctx.model) };
+    }
     var ps = parseSpecString(item.label);
     return { kind: 'num', lower: ps.lower, upper: ps.upper, unit: ps.unit, src: ps.ok ? 'sheet' : 'none' };
   }
@@ -634,10 +739,16 @@
   function judgeUnit(u, overrides, settings) {
     var S = cleanSettings(settings);
     var items = (u.items || []).map(cleanItem);
+    var ctx = { model: unitModel(u.meta) }, picks = u.specPick || {};
     var cells = itemCells(items).map(function (c) {
-      var sp = resolveSpec(c.item, u.meta && u.meta.part, overrides);
+      var sp = resolveSpec(c.item, u.meta && u.meta.part, overrides, { model: ctx.model, pick: picks[c.item.no] });
       var raw = lookupValue(u.values || {}, c.key);
       var j = judgeItem(sp, raw, S);
+      if (sp.ambiguous && j.status === 'nospec') {
+        j.status = 'modelspec';
+        j.msg = '한 칸에 모델별 규격이 ' + sp.modelSpecs.length + '개 — ' + (ctx.model ? '모델 「' + ctx.model + '」 에 맞는 규격이 하나로 정해지지 않음' : '체크한 모델을 알 수 없음') + '. 판독 화면에서 모델이나 규격을 골라 주세요';
+      }
+      j.specModel = sp.model || '';
       j.key = c.key; j.no = c.item.no; j.sub = c.sub; j.label = c.item.label; j.spec = specText(sp); j.specSrc = sp.src;
       return j;
     });
@@ -645,7 +756,8 @@
     var res = { verdict: 'wait', cells: cells, fails: [], blanks: [], unreads: [], checks: [], problems: problems, msg: '' };
     res.fails = cells.filter(function (x) { return x.status === 'fail'; });
     res.blanks = cells.filter(function (x) { return x.status === 'blank'; });
-    res.unreads = cells.filter(function (x) { return x.status === 'unread' || x.status === 'nospec'; });
+    res.unreads = cells.filter(function (x) { return x.status === 'unread' || x.status === 'nospec' || x.status === 'modelspec'; });
+    res.modelPick = cells.filter(function (x) { return x.status === 'modelspec'; });
     res.checks = cells.filter(function (x) { return x.check && x.status === 'pass'; });
     if (!u.done) return res;
     if (!cells.length) { res.verdict = 'hold'; res.msg = '검사 항목이 없습니다.'; return res; }
@@ -799,7 +911,9 @@
     }
     L.push('');
     L.push('[지켜 줄 것]');
-    L.push('- 위쪽 머리 칸(모델명 · 품번 · 품명 · 관리 번호 · 작성일 · 제작 공정명)도 읽어 줘. 모델명에 동그라미 친 것이 있으면 그것만.');
+    L.push('- 위쪽 머리 칸(모델명 · 품번 · 품명 · 관리 번호 · 작성일 · 제작 공정명)도 읽어 줘. 모델명은 칸에 인쇄된 그대로 모두 적어 줘.');
+    L.push('- 모델명 칸에 모델이 여럿이고 그중 하나에 체크(✓ · V · ○ · ■ · 동그라미)가 있으면 그 모델 하나를 "체크모델" 에 적어 줘. 체크가 없거나 둘 이상이거나 확실하지 않으면 "" 로 비워 둬(사람이 고름).');
+    if (its.some(function (it) { return modelSpecs(it.label).length; })) L.push('- 규격 칸에 모델별 규격이 둘 이상 적힌 항목이 있어. 값은 그대로 읽기만 하고, 어느 규격을 쓸지는 고르지 마.');
     L.push('- 호기 열마다 하나씩, 호기 번호가 적힌 열만 적어 줘(빈 열은 빼).');
     L.push('- 칸이 비어 있으면 "", 체크 표시(✓ · V)만 있으면 "✓", 「OK」 라고 적혀 있으면 "OK", 글씨를 알아볼 수 없으면 "?" 로. 추측해서 채우지 마.');
     if (its.some(function (it) { return it.kind === 'attach'; })) L.push('- 체크가 없는 풍선이 있으면 그 자리(VIEW 이름 등)를 「문제점」 에 적어 줘.');
@@ -809,7 +923,7 @@
     L.push('- 검사자 · 결재 칸의 이름 · 서명은 읽지도 적지도 마.');
     L.push('');
     L.push('[답 형식] 아래 JSON 하나만, 다른 설명 없이 답해 줘.');
-    var ans = { 모델명: '', 품번: '', 품명: '', 관리번호: '', 작성일: 'YYYY-MM-DD', 제작공정명: '' };
+    var ans = { 모델명: '', 체크모델: '', 품번: '', 품명: '', 관리번호: '', 작성일: 'YYYY-MM-DD', 제작공정명: '' };
     if (!its.length) ans['항목'] = [{ No: '1', 검사항목: '', 측정기: '', 구분: ['LH', 'RH'] }];
     ans['호기'] = [{ 호기: '', 값: its.length ? tmpl : { '1': '', '2 LH': '', '2 RH': '' } }];
     ans['문제점'] = {};
@@ -817,7 +931,7 @@
     L.push(JSON.stringify(ans, null, 2));
     return L.join('\n');
   }
-  var AI_META = { 모델명: 'model', 모델: 'model', model: 'model', 품번: 'part', part: 'part', 품명: 'name', name: 'name', 관리번호: 'mgmt', 작성일: 'date', date: 'date', 제작공정명: 'process', 공정명: 'process' };
+  var AI_META = { 모델명: 'model', 모델: 'model', model: 'model', 체크모델: 'checkModel', 체크한모델: 'checkModel', checkmodel: 'checkModel', 품번: 'part', part: 'part', 품명: 'name', name: 'name', 관리번호: 'mgmt', 작성일: 'date', date: 'date', 제작공정명: 'process', 공정명: 'process' };
   /* AI 답 → { ok, meta, hogis:[{no, values}], problems, items(답에 항목이 있으면), lowConf, unknown, error } */
   function parseSheetAi(text, items) {
     var out = { ok: false, meta: {}, hogis: [], problems: {}, items: null, lowConf: [], unknown: [], error: '' };
@@ -923,12 +1037,98 @@
      ① 파일(쪽)별 db.maskSheets[검사표 열쇠] ② 공정별 db.maskProcs[공정명 비교 낱말] ③ 모든 검사표 db.masks
      비어 있는 배열도 「이 검사표는 가리지 않음」으로 존중합니다. → { masks, src: 'sheet'|'process'|'all', proc } */
   function procKey(process) { return key(process); }
+  /* 가릴 영역 틀(2026-11-10 4차 ②) — 요청자가 보낸 공정별 사진의 빨간 네모 자리를 쪽 크기 대비 비율로 옮긴 것(조금 넉넉하게).
+     ① 제작 · 가공형 4칸 = 결재(위) · 검사자 · 개정 「확인」 란 · 결재(아래). 검사자 자리는 양식마다 달라 세 가지로 나눴고,
+        도장 양식은 결재란이 없어 「확인」 란 · 검사자 2칸입니다(같은 ① 묶음).
+     ② 상단 결재란 1칸형 = 시트 · 각장 · 비용접구간 — 위쪽 머리 줄의 검사일 · 입안 · 심사 · 결정 값 줄 하나.
+     스캔마다 여백 · 기울기가 조금씩 달라 틀은 출발점입니다 — 어긋난 쪽은 판독 화면에서 「이 파일 · 이 쪽만」 으로 맞춥니다. */
+  var MASK_TEMPLATES = [
+    { id: 'make4', group: 1, name: '① 제작 · 가공형 4칸 — 가공 양식(검사자 위 오른쪽)', masks: [
+      { x: 0.83, y: 0.095, w: 0.145, h: 0.083, label: '결재(위)' }, { x: 0.877, y: 0.167, w: 0.098, h: 0.061, label: '검사자' },
+      { x: 0.51, y: 0.869, w: 0.064, h: 0.105, label: '개정 확인란' }, { x: 0.037, y: 0.89, w: 0.142, h: 0.088, label: '결재(아래)' }] },
+    { id: 'flat4', group: 1, name: '① 제작 · 가공형 4칸 — 평행도 양식(검사자 아래 오른쪽)', masks: [
+      { x: 0.835, y: 0.133, w: 0.144, h: 0.079, label: '결재(위)' }, { x: 0.762, y: 0.899, w: 0.164, h: 0.043, label: '검사자' },
+      { x: 0.514, y: 0.847, w: 0.065, h: 0.101, label: '개정 확인란' }, { x: 0.043, y: 0.864, w: 0.147, h: 0.085, label: '결재(아래)' }] },
+    { id: 'assy4', group: 1, name: '① 제작 · 가공형 4칸 — ASSY 양식(검사자 왼쪽 가운데)', masks: [
+      { x: 0.786, y: 0.044, w: 0.147, h: 0.076, label: '결재(위)' }, { x: 0.115, y: 0.651, w: 0.172, h: 0.047, label: '검사자' },
+      { x: 0.477, y: 0.896, w: 0.065, h: 0.096, label: '개정 확인란' }, { x: 0.02, y: 0.915, w: 0.148, h: 0.075, label: '결재(아래)' }] },
+    { id: 'paint2', group: 1, name: '① 제작 · 가공형 — 도장 양식(결재란 없음 · 확인란 · 검사자 2칸)', masks: [
+      { x: 0.38, y: 0.297, w: 0.07, h: 0.046, label: '개정 확인란' }, { x: 0.717, y: 0.352, w: 0.173, h: 0.058, label: '검사자' }] },
+    { id: 'top1', group: 2, name: '② 상단 결재란 1칸형 — 시트 · 각장 · 비용접구간', masks: [
+      { x: 0.434, y: 0.066, w: 0.32, h: 0.054, label: '상단 결재란(검사일 · 입안 · 심사 · 결정)' }] }
+  ];
+  function maskTemplate(id) { for (var i = 0; i < MASK_TEMPLATES.length; i++) if (MASK_TEMPLATES[i].id === id) return MASK_TEMPLATES[i]; return null; }
+  /* 공정명으로 틀 고르기 — 평행도 · ASSY · 도장 · (시트 · 각장 · 비용접) · (가공 · 제작) 순서. 모르는 공정은 '' (모든 검사표 기본) */
+  function tplForProcess(process) {
+    var s = halfWidth(str(process)).toLowerCase().replace(/['’`]/g, '');
+    if (!s) return '';
+    if (/평행도/.test(s)) return 'flat4';
+    if (/assy|어셈블|조립/.test(s)) return 'assy4';
+    if (/도장|paint/.test(s)) return 'paint2';
+    if (/시트|seat|각장|비\s*용접/.test(s)) return 'top1';
+    if (/가공|제작|machin/.test(s)) return 'make4';
+    return '';
+  }
+  /* 이 공정에 쓰는 틀 — 설정에서 고른 것(d.maskTpl[공정]: 틀 id 또는 'none' = 틀 안 씀)이 먼저, 없으면 공정명으로 자동 */
+  function tplOf(d, process) {
+    var pk = procKey(process);
+    if (!pk) return { id: '', auto: false };
+    var set = d && d.maskTpl && Object.prototype.hasOwnProperty.call(d.maskTpl, pk) ? d.maskTpl[pk] : null;
+    if (set === 'none') return { id: '', auto: false, off: true };
+    if (set && maskTemplate(set)) return { id: set, auto: false };
+    var a = tplForProcess(process);
+    return { id: a, auto: !!a };
+  }
+  /* 세 겹 그대로 — ① 파일(쪽)별 ② 공정별(직접 그린 공정 기본 > 공정 틀) ③ 모든 검사표 기본 */
   function masksFor(d, sk, process) {
     d = d || {};
     if (d.maskSheets && Array.isArray(d.maskSheets[sk])) return { masks: d.maskSheets[sk], src: 'sheet', proc: procKey(process) };
     var pk = procKey(process);
     if (pk && d.maskProcs && Array.isArray(d.maskProcs[pk])) return { masks: d.maskProcs[pk], src: 'process', proc: pk };
+    var tp = tplOf(d, process);
+    if (tp.id) return { masks: maskTemplate(tp.id).masks.map(function (m) { var o = {}; for (var k in m) o[k] = m[k]; return o; }), src: 'template', tpl: tp.id, auto: tp.auto, proc: pk };
     return { masks: Array.isArray(d.masks) ? d.masks : [], src: 'all', proc: pk };
+  }
+  /* 글자 층이 있는 쪽에서 낱말 자리로 가릴 영역 짐작하기 — 「입안 · 심사 · 결정(결재)」 머리 아래 서명 칸, 「검사자」 오른쪽,
+     「개정」 표의 「확인」 열. items = normTextItems 결과(돌린 쪽은 돌린 좌표), pageW · pageH = 쪽 크기. → [{x,y,w,h,label}] (비율)
+     스캔 그림은 글자가 없어 짐작하지 못합니다(빈 배열) — 그때는 공정 틀을 씁니다. */
+  function masksFromText(items, pageW, pageH) {
+    var T = (items || []).map(function (t) { var o = {}; for (var k in t) o[k] = t[k]; o.k = key(t.s); return o; }).filter(function (t) { return t.k; });
+    var out = [];
+    if (!(pageW > 0 && pageH > 0)) return out;
+    function box(x0, y0, x1, y1, label) {
+      x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(pageW, x1); y1 = Math.min(pageH, y1);
+      if (x1 - x0 < 4 || y1 - y0 < 4) return;
+      out.push({ x: round(x0 / pageW, 4), y: round(y0 / pageH, 4), w: round((x1 - x0) / pageW, 4), h: round((y1 - y0) / pageH, 4), label: label });
+    }
+    // 결재 — 같은 줄에 「입안 · 심사 · 결정 · 결재 · 검토 · 승인」 이 둘 이상 나란히(가까이) 있으면 한 묶음
+    var sign = T.filter(function (t) { return /^(입안|심사|결정|결재|검토|승인)$/.test(t.k); }).sort(function (a, b) { return a.y - b.y || a.x - b.x; });
+    var used = [];
+    sign.forEach(function (t) {
+      if (used.indexOf(t) >= 0) return;
+      var grp = sign.filter(function (u) { return used.indexOf(u) < 0 && sameLine(u, t) && Math.abs(u.cx - t.cx) < t.h * 25; });
+      if (grp.length < 2) return;
+      grp.forEach(function (u) { used.push(u); });
+      var h = Math.max.apply(null, grp.map(function (u) { return u.h; }));
+      var x0 = Math.min.apply(null, grp.map(function (u) { return u.x; })), x1 = Math.max.apply(null, grp.map(function (u) { return u.x + u.w; }));
+      var c0 = Math.min.apply(null, grp.map(function (u) { return u.cx; })), c1 = Math.max.apply(null, grp.map(function (u) { return u.cx; }));
+      var half = (c1 - c0) / (grp.length - 1) / 2;                           // 칸 폭의 반 = 머리 글자 가운데 사이의 반
+      box(Math.min(x0, c0 - half), t.y + h * 0.6, Math.max(x1, c1 + half), t.y + h * 7, '결재');
+    });
+    // 검사자 — 이름 칸 오른쪽(다음 글자 전까지, 쪽 폭의 35% 안)
+    T.filter(function (t) { return t.k === '검사자'; }).forEach(function (t) {
+      var right = T.filter(function (u) { return u !== t && sameLine(u, t) && u.x > t.x + t.w + 2; }).sort(function (a, b) { return a.x - b.x; })[0];
+      var x1 = Math.min(right ? right.x - 2 : pageW, t.x + t.w + pageW * 0.35);
+      box(t.x + t.w + 1, t.y - t.h * 1.3, x1, t.y + t.h * 1.3, '검사자');
+    });
+    // 개정 표의 「확인」 열 — 같은 줄 왼쪽에 「개정…」 머리가 있는 「확인」 . 아래로 개정일(날짜) 줄이 끝나는 곳까지
+    T.filter(function (t) { return t.k === '확인' && T.some(function (u) { return /^개정/.test(u.k) && sameLine(u, t) && u.x < t.x; }); }).forEach(function (t) {
+      var rows = T.filter(function (u) { return u.y > t.y + t.h * 0.5 && u.y < t.y + t.h * 14 && u.x < t.x && /^(\d{4}[.\-\/]|\d{1,2}$)/.test(u.s.replace(/\s/g, '')); });
+      var bot = rows.length ? Math.max.apply(null, rows.map(function (u) { return u.y; })) + t.h : t.y + t.h * 6;
+      var half = Math.max(t.w, t.h * 2) * 0.9;
+      box(t.cx - half, t.y + t.h * 0.6, t.cx + half, bot, '개정 확인란');
+    });
+    return out;
   }
   function cleanMasks(arr) { return (Array.isArray(arr) ? arr : []).filter(function (m) { return m && isNum(m.x) && isNum(m.y) && isNum(m.w) && isNum(m.h); }); }
   function cleanMaskMap(o) {
@@ -983,7 +1183,7 @@
   }
 
   // ── 저장 데이터 ──────────────────────────────────────────
-  function emptyDb() { return { v: 2, cleared: false, ships: [], shipFile: '', files: [], readings: {}, overrides: [], overrideFile: '', settings: cleanSettings({}), aiNote: '', masks: [], maskProcs: {}, maskSheets: {}, sample: false, refDate: '' }; }
+  function emptyDb() { return { v: 2, cleared: false, ships: [], shipFile: '', files: [], readings: {}, overrides: [], overrideFile: '', settings: cleanSettings({}), aiNote: '', masks: [], maskProcs: {}, maskSheets: {}, maskTpl: {}, sample: false, refDate: '' }; }
   /* 저장 데이터 되살리기. 1단계(v1 — 로트 · 파일 이름 규칙) 자료는 형식이 달라 버리고 legacy 표시만 남깁니다. */
   function restoreDb(o) {
     var d = emptyDb();
@@ -996,6 +1196,8 @@
     if (Array.isArray(o.masks)) d.masks = cleanMasks(o.masks);
     d.maskProcs = cleanMaskMap(o.maskProcs);      // 2026-11-10 추가 — 옛 자료에는 없으니 빈 칸으로
     d.maskSheets = cleanMaskMap(o.maskSheets);
+    d.maskTpl = {};                               // 4차 — 공정별 틀 고르기(옛 자료에는 없음 = 모두 자동)
+    if (o.maskTpl && typeof o.maskTpl === 'object') Object.keys(o.maskTpl).forEach(function (k) { var v = o.maskTpl[k]; if (k && (v === 'none' || maskTemplate(v))) d.maskTpl[k] = v; });
     d.settings = cleanSettings(o.settings);
     d.cleared = !!o.cleared;
     d.shipFile = str(o.shipFile); d.overrideFile = str(o.overrideFile); d.aiNote = str(o.aiNote); d.sample = !!o.sample;
@@ -1013,7 +1215,8 @@
     parseNumber: parseNumber, unitInfo: unitInfo, judgeItem: judgeItem,
     TEMPLATE: TEMPLATE, META_IDS: META_IDS, cellKey: cellKey, itemCells: itemCells, cleanItem: cleanItem, judgeAttach: judgeAttach,
     sheetKey: sheetKey, pagesOf: pagesOf, sheetPages: sheetPages, sheetLabel: sheetLabel, nearModelName: nearModelName,
-    procKey: procKey, masksFor: masksFor, cleanMasks: cleanMasks, normRot: normRot, textRotation: textRotation, viewportTextItems: viewportTextItems,
+    procKey: procKey, masksFor: masksFor, MASK_TEMPLATES: MASK_TEMPLATES, maskTemplate: maskTemplate, tplForProcess: tplForProcess, tplOf: tplOf, masksFromText: masksFromText,
+    modelMarks: modelMarks, modelSpecs: modelSpecs, unitModel: unitModel, pickModelSpec: pickModelSpec, cleanMasks: cleanMasks, normRot: normRot, textRotation: textRotation, viewportTextItems: viewportTextItems,
     procPreset: procPreset, mergeShips: mergeShips,
     normTextItems: normTextItems, parseSheetText: parseSheetText,
     hintFromName: hintFromName, knownIds: knownIds, buildUnits: buildUnits, isDone: isDone,

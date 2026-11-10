@@ -372,13 +372,14 @@ await test('같은 호기 · 다른 공정 검사표는 모두 봄 — 하나라
 await test('가릴 영역(추가 요청) — 파일(쪽)별 > 공정별 > 모든 검사표, 빈 배열도 「가리지 않음」 으로 존중 · 옛 자료는 빈 칸으로 읽힘', () => {
   const all = [{ x: 0.1, y: 0.1, w: 0.1, h: 0.1 }], proc = [{ x: 0.5, y: 0.1, w: 0.2, h: 0.1 }], own = [{ x: 0.7, y: 0.7, w: 0.1, h: 0.1 }];
   const d = { masks: all, maskProcs: { [L.procKey('시트 부착')]: proc }, maskSheets: { 'f#2': own, g: [] } };
-  assert.deepEqual([L.masksFor(d, 'f', 'ASSY 검사').src, L.masksFor(d, 'f', '시트  부착').src, L.masksFor(d, 'f#2', '시트 부착').src, L.masksFor(d, 'g', '').src], ['all', 'process', 'sheet', 'sheet']);
+  // 「ASSY 검사」 는 4차부터 공정 틀(ASSY 양식)이 자동으로 붙음 — 모르는 공정명이라야 「모든 검사표 기본」
+  assert.deepEqual([L.masksFor(d, 'f', 'ASSY 검사').src, L.masksFor(d, 'f', '하부 프레임 사상').src, L.masksFor(d, 'f', '시트  부착').src, L.masksFor(d, 'f#2', '시트 부착').src, L.masksFor(d, 'g', '').src], ['template', 'all', 'process', 'sheet', 'sheet']);
   assert.equal(L.masksFor(d, 'f', '시트 부착').masks, proc);
   assert.equal(L.masksFor(d, 'g', '').masks.length, 0);
   const r = L.restoreDb({ v: 2, masks: all, maskProcs: { a: [{ x: 1, y: 1, w: 1, h: 1 }, { x: 'z' }], b: 'x' }, maskSheets: { s: own } });
   assert.deepEqual([r.maskProcs.a.length, 'b' in r.maskProcs, r.maskSheets.s.length], [1, false, 1]);
   const old = L.restoreDb({ v: 2, masks: all, ships: [], files: [] });     // 2차(10-28) 자료 — 새 칸이 없음
-  assert.deepEqual([old.masks.length, old.maskProcs, old.maskSheets, L.masksFor(old, 'f', '시트 부착').src], [1, {}, {}, 'all']);
+  assert.deepEqual([old.masks.length, old.maskProcs, old.maskSheets, L.masksFor(old, 'f', '시트 부착').src, L.masksFor(old, 'f', '하부 프레임 사상').src], [1, {}, {}, 'template', 'all']);   // 4차 — 「시트」 는 틀이 자동
 });
 await test('돌아간 쪽(추가 요청) — 글자 방향으로 돌릴 각도를 알아내고(0 · 90 · 180 · 270), 돌려 옮긴 글자 층을 똑같이 읽음', async () => {
   const T = (a, b, c, d) => ({ str: '가나다', transform: [a, b, c, d, 0, 0] });
@@ -398,6 +399,116 @@ await test('돌아간 쪽(추가 요청) — 글자 방향으로 돌릴 각도�
   assert.deepEqual([got.meta, got.items, got.hogis], [want.meta, want.items, want.hogis]);
   const same = L.parseSheetText(L.normTextItems(L.viewportTextItems(raw, vp.transform, Hh), Hh));   // 돌리지 않은 쪽은 그대로
   assert.deepEqual(same.hogis, want.hogis);
+});
+
+console.log('2026-11-10 4차 요청 반영');
+await test('가릴 영역 틀(4차 ②) — 공정명으로 자동(평행도 · ASSY · 가공 · 제작 · 도장 → ①, 시트 · 각장 · 비용접 → ②), 설정이 자동보다 먼저 · 세 겹은 그대로', () => {
+  const P = ['CHANNEL 평행도 검사', "ASS'Y 검사", '가공', '제작', '도장', '시트', '각장', '비용접구간', '시트 부착', '하부 프레임 사상', ''];
+  assert.deepEqual(P.map(L.tplForProcess), ['flat4', 'assy4', 'make4', 'make4', 'paint2', 'top1', 'top1', 'top1', 'top1', '', '']);
+  const g = (id) => L.maskTemplate(id);
+  assert.deepEqual(['make4', 'flat4', 'assy4'].map(id => g(id).masks.map(m => m.label).sort()), Array(3).fill(['개정 확인란', '검사자', '결재(아래)', '결재(위)']));   // ① = 기존 3칸 + 확인란
+  assert.deepEqual([g('paint2').masks.length, g('top1').masks.length, g('top1').group, g('make4').group], [2, 1, 2, 1]);
+  L.MASK_TEMPLATES.forEach(t => t.masks.forEach(m => assert.ok(m.x >= 0 && m.y >= 0 && m.x + m.w <= 1 && m.y + m.h <= 1 && m.w > 0.02 && m.h > 0.01, t.id + ' ' + m.label)));
+  // 시트 틀은 위쪽 10% 안 한 줄(상단 결재란) · 가공 틀의 결재(아래)는 아래쪽
+  assert.ok(g('top1').masks[0].y < 0.1 && g('make4').masks.find(m => m.label === '결재(아래)').y > 0.8);
+  const all = [{ x: 0.1, y: 0.1, w: 0.1, h: 0.1 }], own = [{ x: 0.7, y: 0.7, w: 0.1, h: 0.1 }], drawn = [{ x: 0.2, y: 0.2, w: 0.2, h: 0.1 }];
+  const d = { masks: all, maskProcs: { [L.procKey('도장')]: drawn }, maskSheets: { s: own }, maskTpl: { [L.procKey('가공')]: 'top1', [L.procKey('시트')]: 'none' } };
+  const f = (sk, p) => { const r = L.masksFor(d, sk, p); return [r.src, r.tpl || '', r.auto || false, r.masks.length]; };
+  assert.deepEqual(f('x', 'CHANNEL 평행도 검사'), ['template', 'flat4', true, 4]);      // 자동
+  assert.deepEqual(f('x', '가공'), ['template', 'top1', false, 1]);                    // 설정에서 바꿈
+  assert.deepEqual(f('x', '시트'), ['all', '', false, 1]);                            // 「틀 안 씀」 → 모든 검사표 기본
+  assert.deepEqual(f('x', '도장'), ['process', '', false, 1]);                        // 직접 그린 공정 기본이 틀보다 먼저
+  assert.deepEqual(f('s', '가공'), ['sheet', '', false, 1]);                          // 이 파일 · 이 쪽만이 가장 먼저
+  const m1 = L.masksFor(d, 'x', '제작').masks; m1[0].x = 0.99;                         // 틀은 복사본 — 고쳐도 틀이 바뀌지 않음
+  assert.equal(L.maskTemplate('make4').masks[0].x, 0.83);
+  const r = L.restoreDb({ v: 2, maskTpl: { a: 'top1', b: 'none', c: 'zzz', '': 'make4' } });
+  assert.deepEqual(r.maskTpl, { a: 'top1', b: 'none' });
+  assert.deepEqual(L.restoreDb({ v: 2 }).maskTpl, {});                                // 옛 자료 — 모두 자동
+});
+await test('글자 층이 있는 쪽은 「입안 · 심사 · 결정」 · 「검사자」 · 「개정 … 확인」 낱말 자리로 가릴 영역을 짐작(샘플 결재 칸과 겹침 50% 이상) · 스캔 쪽은 짐작하지 않음', async () => {
+  const iou = (a, b) => { const x = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)), y = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y)); const i = x * y; return i / (a.w * a.h + b.w * b.h - i); };
+  for (const f of SM.files.filter(x => x.kind === 'text')) {
+    const doc = await pdfjs.getDocument({ data: new Uint8Array(Buffer.from(Pdfs[f.name], 'base64')), isEvalSupported: false, verbosity: 0 }).promise;
+    const pg = await doc.getPage(1), vp = pg.getViewport({ scale: 1 });
+    const est = L.masksFromText(L.normTextItems((await pg.getTextContent()).items, vp.height), vp.width, vp.height);
+    assert.deepEqual(est.map(m => m.label).sort(), ['검사자', '결재', '결재'], f.name);
+    SM.masks.forEach(m => assert.ok(Math.max(...est.map(e => iou(e, m))) >= 0.5, f.name + ' ' + m.label));
+  }
+  // 「개정 내용 … 확인」 열 — 개정일 줄이 끝나는 곳까지
+  const T = (s, x, y, w) => ({ s, x, y, w: w || s.length * 7, h: 8, cx: x + (w || s.length * 7) / 2 });
+  const est2 = L.masksFromText([T('개정내용', 100, 500), T('확인', 300, 500), T('2024.03.02', 20, 515), T('2025.01.10', 20, 530), T('1', 5, 530, 6)], 800, 600);
+  assert.equal(est2.length, 1);
+  assert.equal(est2[0].label, '개정 확인란');
+  assert.ok(est2[0].y * 600 > 500 && (est2[0].y + est2[0].h) * 600 >= 535 && est2[0].x * 800 < 300 && (est2[0].x + est2[0].w) * 800 > 314);
+  assert.deepEqual(L.masksFromText([T('확인', 300, 500)], 800, 600), []);           // 개정 표 머리가 없는 「확인」 은 아님
+  assert.deepEqual(L.masksFromText([], 800, 600), []);                               // 스캔(글자 없음)
+});
+await test('출하일정은 「모델 · 호기 · 출하예정」 세 칸만(4차 ③) — 소형 · 대형 · 초대형 형식 모두, 나머지 칸(상부 · 하부 · Line · 품번 · 수량 · BOOM)은 읽지도 알리지도 않음', () => {
+  const small = L.parseShip(aoaOf('출하일정_소형형식_샘플.xlsx'), null, { year: 2026, only3: true });
+  assert.deepEqual([small.det.headerRow, small.det.map], [0, { model: 1, hogi: 2, date: 3 }]);
+  assert.deepEqual(small.rows.map(x => [x.date, x.model, x.hogi, x.part, x.qty]), [['2026-11-12', 'MODEL-A100', '314501', '', null], ['2026-11-12', 'MODEL-A100', '314502', '', null], ['2026-11-13', 'MODEL-B200', '315010', '', null], ['', 'MODEL-B200', '315011', '', null]]);
+  assert.deepEqual(small.warnings.map(w => w.msg), ['출하예정이 빈 줄 1개는 날짜 없이 넣었습니다(호기는 대조함).']);   // 빈 날짜는 한 줄로만
+  const big = L.parseShip(aoaOf('출하일정_대형형식_샘플.xlsx'), null, { year: 2026, only3: true });
+  assert.deepEqual([big.det.headerRow, big.det.map], [2, { model: 1, hogi: 3, date: 6 }]);   // 「호기수(참고)」 보다 이름이 똑같은 「호  기」
+  assert.deepEqual(big.rows.map(x => [x.date, x.model, x.hogi, x.part]), [['2026-11-10', 'MODEL-A100', '314503', ''], ['2026-11-12', 'MODEL-B200', '315012', ''], ['2026-11-12', 'MODEL-B200', '315013', ''], ['2026-11-14', 'MODEL-C300', '520104', '']]);
+  assert.deepEqual(big.warnings.map(w => w.msg), ['연도 없이 「월/일」로 적힌 출하일 3줄은 2026년으로 봤습니다(기준일의 연도).']);   // 「11/10(화)」 · 「11월 12일」
+  const ultra = L.parseShip(aoaOf('출하일정_초대형형식_샘플.xlsx'), null, { year: 2026, only3: true });
+  assert.deepEqual([ultra.det.map, ultra.rows.length, ultra.warnings.length], [{ model: 4, hogi: 5, date: 8 }, 5, 1]);
+  // 끄면(세 칸만 읽기 해제) 품번 · 수량도 읽음 — 예전 방식
+  const full = L.parseShip(aoaOf('출하일정_대형형식_샘플.xlsx'), null, { year: 2026 });
+  assert.deepEqual([full.det.map.part, full.rows[0].part, full.rows[0].qty], [4, 'QA-70011', 1]);
+  // 모델 칸이 없으면 세 칸 방식에서는 필수 칸이 빠졌다고 알림
+  assert.deepEqual(L.parseShip([['품번', '호기', '출하예정'], ['P-1', '1', '2026-11-10']], null, { only3: true }).det.missing, ['모델']);
+  // 세 칸만 쓰므로 출하일정에 품번이 없어도 검사표와 모델 + 호기로 짝
+  const an = L.analyze(big.rows, sampleFiles(), readingsFor(['text']), [], S0, '2026-11-10');
+  assert.deepEqual(an.rows.filter(r => r.ship.hogi === '314503' || r.ship.hogi === '315012').map(r => [r.ship.hogi, r.status, r.how]), [['314503', 'pass', 'model'], ['315012', 'pass', 'model']]);
+});
+await test('모델명 칸의 체크 표시 읽기(4차 ④) — ✓ · ■ · ○ · (V) · 띄어 쓴 V, 빈 상자 □ 는 체크 아님, 이름 속 V 는 그대로 · 한 칸의 모델별 규격 나누기', () => {
+  const mk = (s) => { const r = L.modelMarks(s); return [r.models, r.checked]; };
+  assert.deepEqual(mk('MODEL-A100 / MODEL-B200✓ / MODEL-C300'), [['MODEL-A100', 'MODEL-B200', 'MODEL-C300'], ['MODEL-B200']]);
+  assert.deepEqual(mk('□A100 ■B200 □C300'), [['A100', 'B200', 'C300'], ['B200']]);
+  assert.deepEqual(mk('○A100/B200'), [['A100', 'B200'], ['A100']]);
+  assert.deepEqual(mk('A100(V)/B200'), [['A100', 'B200'], ['A100']]);
+  assert.deepEqual(mk('V B200 / EV100 / VX-2'), [['B200', 'EV100', 'VX-2'], ['B200']]);
+  assert.deepEqual(mk('MODEL-A100 / MODEL-A100E'), [['MODEL-A100', 'MODEL-A100E'], []]);
+  assert.deepEqual(L.splitModels('MODEL-A100✓/MODEL-B200'), ['MODEL-A100', 'MODEL-B200']);      // 짝 지을 때는 체크 표시를 뗀 이름
+  const ms = L.modelSpecs('LH 상면 높이 MODEL-A100 SPEC:366±2 MODEL-B200 SPEC:363±2');
+  assert.deepEqual(ms.map(x => [x.models, x.lower, x.upper]), [[['MODEL-A100'], 364, 368], [['MODEL-B200'], 361, 365]]);
+  const ms2 = L.modelSpecs('높이(H/G) A100 BR:571±2 / A200E/EHR:468±2');                       // 「E/EHR」 → 「A200E · A200EHR」
+  assert.deepEqual(ms2.map(x => x.models), [['A100 BR'], ['A200E', 'A200EHR']]);
+  assert.deepEqual([L.modelSpecs('420±1'), L.modelSpecs('LH 420±1 RH 420±2'), L.modelSpecs('A100: 10±1 / B200: 10±1'), L.modelSpecs('48 +1.0/-0.5')], [[], [], [], []]);   // 규격 하나 · 구분 줄 · 같은 규격은 모델별이 아님
+});
+await test('한 칸에 모델별 규격이 둘(4차 ④) — 체크한 모델의 규격으로 판정, 모르면 그 칸 「보류」(첫 규격만 읽지 않음) · 사람이 모델이나 규격을 고르면 판정', () => {
+  const items = [{ no: '1', label: 'LH 상면 높이 MODEL-A100 SPEC:366±2 MODEL-B200 SPEC:363±2' }, { no: '2', label: '10±1' }];
+  const u = (model, v, extra) => Object.assign({ items, meta: { model }, values: { '1': v, '2': '10' }, done: true }, extra || {});
+  const J = (x) => { const j = L.judgeUnit(x, [], S0); return [j.verdict, j.cells[0].status]; };
+  assert.deepEqual(J(u('MODEL-A100 ✓ / MODEL-B200', '367')), ['pass', 'pass']);       // A100 = 364~368
+  assert.deepEqual(J(u('MODEL-A100 / ✓MODEL-B200', '367')), ['fail', 'fail']);        // B200 = 361~365 → 상한 초과
+  assert.deepEqual(J(u('MODEL-B200', '364')), ['pass', 'pass']);                       // 모델이 하나뿐이면 그것
+  assert.deepEqual(J(u('MODEL-A100 / MODEL-B200', '367')), ['hold', 'modelspec']);     // 체크를 못 읽음 → 보류
+  assert.deepEqual(J(u('MODEL-A100 ✓ / MODEL-B200 ✓', '367')), ['hold', 'modelspec']); // 체크가 둘 → 보류
+  assert.deepEqual(J(u('MODEL-C300', '367')), ['hold', 'modelspec']);                  // 어느 규격에도 없는 모델 → 보류
+  assert.match(L.judgeUnit(u('MODEL-A100 / MODEL-B200', '367'), [], S0).cells[0].msg, /모델별 규격이 2개/);
+  // 사람이 고름 — 「체크한 모델」 또는 이 항목의 규격 번호
+  assert.deepEqual(J(u('MODEL-A100 / MODEL-B200', '367', { meta: { model: 'MODEL-A100 / MODEL-B200', checkModel: 'MODEL-B200' } })), ['fail', 'fail']);
+  assert.deepEqual(J(u('MODEL-A100 / MODEL-B200', '367', { specPick: { '1': 0 } })), ['pass', 'pass']);
+  assert.deepEqual(J(u('MODEL-A100 ✓ / MODEL-B200', '367', { specPick: { '1': 1 } })), ['fail', 'fail']);   // 고른 규격이 체크보다 먼저
+  assert.deepEqual(J(u('MODEL-A100 / MODEL-B200', 'OK')), ['pass', 'pass']);           // OK 는 규격과 관계없이 합격
+  assert.deepEqual(J(u('MODEL-A100 / MODEL-B200', '?', { meta: { model: 'MODEL-A100 / MODEL-B200', checkModel: '?' } })), ['hold', 'unread']);
+  // 가까운 이름(출하일정 · 검사표의 꼬리 글자 차이)도 그 모델의 규격으로
+  assert.deepEqual(J(u('MODEL-A100L', '367')), ['pass', 'pass']);
+  assert.equal(L.specText(L.resolveSpec(L.cleanItem(items[0], 0), '', [], { model: '' })), '모델별 규격 2개(MODEL-A100 364 ~ 368 / MODEL-B200 361 ~ 365) — 모델을 골라 주세요');
+  // 저장 → 출하 대조까지: 보류는 미판정, 체크한 모델을 적으면 판정
+  const files = [{ id: 'f', name: 'a.pdf' }], ship = [{ date: '2026-11-11', model: 'MODEL-A100', hogi: '7' }];
+  const rd = (meta) => ({ f: { meta, items, hogis: [{ no: '7', values: { '1': '367', '2': '10' } }], done: true, at: '1' } });
+  assert.equal(L.analyze(ship, files, rd({ model: 'MODEL-A100 / MODEL-B200' }), [], S0, '2026-11-10').rows[0].status, 'hold');
+  assert.equal(L.analyze(ship, files, rd({ model: 'MODEL-A100 / MODEL-B200', checkModel: 'MODEL-A100' }), [], S0, '2026-11-10').rows[0].status, 'pass');
+  // AI 답의 「체크모델」 도 같은 칸으로 · 판독 프롬프트가 체크모델을 묻고, 모델별 규격 항목이 있으면 고르지 말라고 함
+  const p = L.parseSheetAi(JSON.stringify({ 모델명: 'MODEL-A100 / MODEL-B200', 체크모델: 'MODEL-B200', 호기: [{ 호기: '7', 값: { '1': '367' } }] }), items);
+  assert.deepEqual([p.meta.model, p.meta.checkModel], ['MODEL-A100 / MODEL-B200', 'MODEL-B200']);
+  const pr = L.buildSheetPrompt(items);
+  assert.match(pr, /"체크모델"/); assert.match(pr, /어느 규격을 쓸지는 고르지 마/);
+  assert.doesNotMatch(L.buildSheetPrompt([{ no: '1', label: '10±1' }]), /어느 규격을 쓸지/);
 });
 
 console.log('샘플 · 저장 · 리포');
