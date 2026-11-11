@@ -108,7 +108,7 @@ window.AUTH_CONFIG = {
         },
         {
           "name": "설정",
-          "desc": "판정 규칙(경계값 · 빈 칸 · 체크만 한 칸 · 경계 근처 %), 가릴 영역, AI 연결(OpenAI 호환 주소 · 모델 · 본인 키, 기억은 선택), JSON 백업 · 모두 지우기"
+          "desc": "판정 규칙(경계값 · 빈 칸 · 체크만 한 칸 · 경계 근처 %), 가릴 영역(공정별 틀), AI 연결(OpenAI 호환 주소 · 모델 · 본인 키, 기억은 선택), JSON 백업 · 모두 지우기"
         }
       ],
       "data": [
@@ -196,7 +196,9 @@ window.AUTH_CONFIG = {
       },
       "company": {
         "name": "건화",
-        "en": "KUNHWA"
+        "en": "KUNHWA",
+        "logo": "images/logo.png",
+        "logoH": 40
       }
     }
   }
