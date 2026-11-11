@@ -8,6 +8,7 @@ window.AUTH_CONFIG = {
   "kakao": true,
   "idleMinutes": 30,
   "localBypass": true,
+  "board": true,
   "site": {
     "title": "불량 제품 파악",
     "summary": "공유폴더의 수기 검사표 PDF를 쪽마다 판독해 검사표에 적힌 공차로 호기별 합불을 판정하고, 출하일정과 맞춰 검사표 없음 · 불합격 · 미판정 리스트를 만드는 브라우저 도구입니다.",
@@ -199,7 +200,8 @@ window.AUTH_CONFIG = {
         "en": "KUNHWA",
         "logo": "images/logo.png",
         "logoH": 40
-      }
+      },
+      "heroMode": "design"
     }
   }
 };
