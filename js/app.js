@@ -7,7 +7,7 @@
   var L = window.QCLogic, S = window.QCStore, SM = window.QCSample, E = window.AIEndpoint, AIP = window.AIPanel, XLSX = window.XLSX;
   /* 판 맞추기 — 브라우저가 옛 logic.js 와 새 app.js 를 섞어 쓰면(Pages 캐시) 버튼과 결과가 어긋날 수 있어, 섞였으면 계산하지 않고 새로고침을 안내합니다.
      판은 scripts/bump-version.mjs 로 index.html(?v=) · logic.js 와 함께 올립니다. */
-  var APP_VERSION = '2026-11-11.6';
+  var APP_VERSION = '2026-11-11.8';
   if (!L || L.VERSION !== APP_VERSION) {
     var m0 = document.getElementById('main') || document.body;
     m0.innerHTML = '<section class="card" id="versionMismatch"><h1>새 판이 나왔습니다 — 새로고침(Ctrl+F5)해 주세요</h1><p class="alert warn">이 브라우저가 옛 파일과 새 파일을 섞어 불러왔습니다(js/logic.js ' +
@@ -260,6 +260,31 @@
       render();
     }, function (e) { toast(e.message, true); });
   }
+  /* 출하일정 엑셀 여러 개를 한 번에(11-11 요청 — 소형 · 대형 · 초대형 파일이 따로) — 파일마다 자동으로 읽어 합칩니다.
+     칸을 못 찾은 파일은 넣지 않고 알려 줍니다(그 파일만 따로 골라 열 연결을 맞춥니다). */
+  function loadShipMany(files) {
+    Promise.all(files.map(function (file) {
+      return readXlsx(file).then(function (sheets) {
+        var sh = pickSheet(sheets, fieldsOf('ship')), p = { kind: 'ship', file: file.name, sheets: sheets, sheet: sh.name, override: {} };
+        parsePending(p); return p;
+      }, function (e) { return { file: file.name, error: e.message }; });
+    })).then(function (ps) {
+      var good = ps.filter(function (p) { return !p.error && !p.result.det.missing.length && p.result.rows.length; });
+      var bad = ps.filter(function (p) { return good.indexOf(p) < 0; });
+      if (!good.length) { toast('읽을 수 있는 출하일정이 없습니다 — 한 개씩 골라 열 연결을 확인해 주세요.', true); return; }
+      if (db.sample) { if (!confirm('지금은 가상 샘플입니다. 샘플을 모두 지우고 이 엑셀 ' + good.length + '개로 시작할까요?')) return; startFresh(); }
+      else if (db.ships.length && !confirm('지금 출하일정(' + db.ships.length + '대)에 엑셀 ' + good.length + '개를 더할까요? (같은 모델 · 호기는 새 파일 것으로)')) return;
+      var before = db.ships.length, names = [];
+      good.forEach(function (p) {
+        var rows = p.result.rows.map(function (r) { var o = Object.assign({}, r); delete o.row; o.file = p.file; return o; });
+        db.ships = db.ships.length ? L.mergeShips(db.ships, rows) : rows; names.push(p.file);
+      });
+      db.shipFile = (before && db.shipFile ? db.shipFile + ' + ' : '') + names.join(' + '); ui.pendShip = null;
+      save();
+      toast('출하일정 엑셀 ' + good.length + '개를 넣었습니다 — ' + before + '대 → ' + db.ships.length + '대.' + (bad.length ? ' 읽지 못한 파일 ' + bad.length + '개(' + bad.map(function (p) { return p.file; }).join(', ') + ')는 한 개씩 골라 주세요.' : ''), !!bad.length);
+      render();
+    });
+  }
   function parsePending(p) {
     var sh = p.sheets.filter(function (s) { return s.name === p.sheet; })[0];
     p.result = p.kind === 'ship' ? L.parseShip(sh.aoa, p.override, { year: +refDate().slice(0, 4), only3: p.only3 !== false }) : L.parseSpec(sh.aoa, p.override);
@@ -309,7 +334,7 @@
         } }, '지금 출하일정에 더하기') : null,
         h('button', { type: 'button', class: 'btn', onclick: function () { if (p.kind === 'ship') ui.pendShip = null; else ui.pendSpec = null; render(); } }, '취소')));
   }
-  function addPdfs(list) {
+  function addPdfs(list, group) {
     var all = Array.prototype.slice.call(list || []), files = all.filter(function (f) { return /\.pdf$/i.test(f.name); });
     if (!files.length) { toast('PDF 파일이 없습니다.', true); return; }
     if (db.sample) { if (!confirm('지금은 가상 샘플입니다. 샘플을 지우고 내 PDF 로 시작할까요? (출하일정도 함께 지워집니다)')) return; startFresh(); }
@@ -319,7 +344,10 @@
       if (fileById(id)) { dup++; return Promise.resolve(); }
       return f.arrayBuffer().then(function (buf) {
         return S.putPdf(id, new Uint8Array(buf)).then(function (stored) {
+          // 구분(고객사 등) — 적어 준 이름, 없으면 「폴더째 고르기」의 바로 위 폴더 이름(11-11 요청: 고객사별로 나눠 보기)
+          var parts = String(f.webkitRelativePath || '').split('/'), g = String(group || '').trim() || (parts.length > 1 ? parts[parts.length - 2] : '');
           var rec = { id: id, name: f.name, size: f.size, at: nowText(), hasPdf: true, stored: stored };
+          if (g) rec.group = g.slice(0, 40);
           db.files.push(rec); added.push(rec);
         });
       });
@@ -332,6 +360,7 @@
       toast('PDF ' + added.length + '개(' + n.pages + '쪽)를 넣었습니다 — 글자 층에서 읽음 ' + n.text + '쪽 · 그림만(사람 · AI 판독) ' + n.image + '쪽' + (dup ? ' · 이미 있는 ' + dup + '개는 건너뜀' : '') + (all.length - files.length ? ' · PDF 아닌 파일 ' + (all.length - files.length) + '개 건너뜀' : '') + '.');
     }, function (e) { ui.busy = ''; toast('PDF 를 넣지 못했습니다: ' + e.message, true); render(); });
   }
+  function groupsOf() { return db.files.map(function (f) { return f.group || ''; }).filter(function (g, i, a) { return g && a.indexOf(g) === i; }).sort(); }
   function kindLabel(f, page) {
     var t = f.pageText && f.pageText[page || 1] !== undefined ? f.pageText[page || 1] : f.text;
     return t === true ? '글자 층' : t === false ? '그림만(스캔)' : t === 'partial' ? '글자 층(양식 다름)' : '확인 전';
@@ -343,11 +372,16 @@
   }
   function pageImport() {
     var an = analysis(), c = an.counts;
-    var shipIn = h('input', { type: 'file', accept: '.xlsx,.xls,.csv' }); shipIn.addEventListener('change', function () { if (shipIn.files[0]) loadTable('ship', shipIn.files[0]); shipIn.value = ''; });
+    var shipIn = h('input', { type: 'file', accept: '.xlsx,.xls,.csv', multiple: true });
+    shipIn.addEventListener('change', function () { var fs = Array.prototype.slice.call(shipIn.files || []); if (fs.length === 1) loadTable('ship', fs[0]); else if (fs.length > 1) loadShipMany(fs); shipIn.value = ''; });
     var specIn = h('input', { type: 'file', accept: '.xlsx,.xls,.csv' }); specIn.addEventListener('change', function () { if (specIn.files[0]) loadTable('spec', specIn.files[0]); specIn.value = ''; });
-    var pdfIn = h('input', { type: 'file', accept: '.pdf,application/pdf', multiple: true }); pdfIn.addEventListener('change', function () { addPdfs(pdfIn.files); pdfIn.value = ''; });
-    var dirIn = h('input', { type: 'file', webkitdirectory: true, multiple: true }); dirIn.addEventListener('change', function () { addPdfs(dirIn.files); dirIn.value = ''; });
-    var drop = h('div', { class: 'drop' }, h('span', null, 'PDF 를 여기에 끌어 놓거나'), h('label', { class: 'btn btn-primary' }, pdfIn, 'PDF 여러 개 고르기'), h('label', { class: 'btn' }, dirIn, '폴더째 고르기'));
+    var grpIn = h('input', { type: 'text', class: 'grp-in', maxlength: 40, placeholder: '구분(고객사 등 · 선택)', 'aria-label': '넣는 검사표의 구분', list: 'grpList', value: ui.addGroup || '' });
+    grpIn.addEventListener('input', function () { ui.addGroup = grpIn.value; });
+    var pdfIn = h('input', { type: 'file', accept: '.pdf,application/pdf', multiple: true }); pdfIn.addEventListener('change', function () { addPdfs(pdfIn.files, grpIn.value); pdfIn.value = ''; });
+    var dirIn = h('input', { type: 'file', webkitdirectory: true, multiple: true }); dirIn.addEventListener('change', function () { addPdfs(dirIn.files, grpIn.value); dirIn.value = ''; });
+    var drop = h('div', { class: 'drop' }, h('span', null, 'PDF 를 여기에 끌어 놓거나'), h('label', { class: 'btn btn-primary' }, pdfIn, 'PDF 여러 개 고르기'), h('label', { class: 'btn' }, dirIn, '폴더째 고르기'),
+      grpIn, h('datalist', { id: 'grpList' }, groupsOf().map(function (g) { return h('option', { value: g }); })),
+      h('span', { class: 'note', style: 'flex-basis:100%' }, '구분을 적고 넣으면 ② 판독에서 그 구분만 골라 볼 수 있습니다. 비워 두고 「폴더째 고르기」를 쓰면 폴더 이름이 구분이 됩니다.'));
     drop.addEventListener('dragover', function (e) { e.preventDefault(); drop.classList.add('over'); });
     drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
     drop.addEventListener('drop', function (e) { e.preventDefault(); drop.classList.remove('over'); addPdfs(e.dataTransfer.files); });
@@ -361,7 +395,7 @@
         h('section', { class: 'step-card' }, h('h3', null, '1. 출하일정 엑셀', done(db.ships.length, db.ships.length + '대')),
           h('p', { class: 'note' }, '「언제 · 어떤 모델/품번 · 몇 호기를 내보내는지」를 읽습니다. 열: 출하일(출하예정) · 모델 · 품번 · 호기 · 수량(이름이 조금 달라도 찾고, 못 찾으면 골라 연결). 「314498~314500」 처럼 적힌 호기는 펼치고, 「8/10」 처럼 연도가 없으면 기준일의 연도로 봅니다. 소형 · 초대형 등 파일이 여러 개면 하나씩 「더하기」로 합칩니다.'),
           db.shipFile ? h('p', { class: 'note' }, '지금: ' + db.shipFile) : null,
-          h('label', { class: 'btn' }, shipIn, '엑셀 고르기')),
+          h('label', { class: 'btn' }, shipIn, '엑셀 고르기(여러 개 가능)')),
         h('section', { class: 'step-card' }, h('h3', null, '2. 검사표 PDF', done(db.files.length, db.files.length + '장')),
           h('p', { class: 'note' }, '파일 이름은 따지지 않습니다. 한 PDF 에 여러 쪽(호기 · 공정)이 있으면 쪽마다 검사표 한 장으로 봅니다. 글자 층이 있는 쪽은 칸 자리로 바로 읽고, 스캔 그림은 ② 판독에서 그림을 보며 옮기거나 AI 로 읽습니다.'),
           h('a', { class: 'btn', href: '#/ship' }, '① 출하 대조로')),
@@ -469,7 +503,9 @@
     if (!withPdf.length) return [head0, emptyNotice('아직 넣은 검사표 PDF 가 없습니다.')];
     var an = analysis(), ids = idInfoMap(an);
     function todo(f) { return L.sheetPages(f).some(function (pg) { return sheetTodo(an, ids, f, pg); }); }
+    var groups = groupsOf(); if (ui.grp && ui.grp !== '(없음)' && groups.indexOf(ui.grp) < 0) ui.grp = '';
     var list = withPdf.filter(function (f) {
+      if (ui.grp && (ui.grp === '(없음)' ? !!f.group : f.group !== ui.grp)) return false;
       if (ui.fileFilter === 'todo') return todo(f);
       if (ui.fileFilter === 'fail') return L.sheetPages(f).some(function (pg) { return sheetVerdict(an, L.sheetKey(f.id, pg)) === 'fail'; });
       return true;
@@ -491,11 +527,20 @@
     var filt = h('div', { class: 'tabs', role: 'group', 'aria-label': '파일 거르기', style: 'margin:0' }, [['todo', '할 일(대기 · 보류 · 식별)'], ['fail', '불합격'], ['all', '전체 ' + withPdf.length]].map(function (x) {
       return h('button', { type: 'button', 'aria-pressed': ui.fileFilter === x[0] ? 'true' : 'false', onclick: function () { ui.fileFilter = x[0]; ui.cur = ''; render(); } }, x[1]);
     }));
+    // 구분(고객사 등)으로 거르기 · 지금 파일의 구분 바꾸기
+    function grpBar() {
+      var sel = h('select', { class: 'grp-sel', 'aria-label': '구분으로 거르기' }, [['', '구분: 전체']].concat(groups.map(function (g) { return [g, g + ' (' + withPdf.filter(function (x) { return x.group === g; }).length + ')']; })).concat(groups.length ? [['(없음)', '구분 없음']] : []).map(function (o) { return h('option', { value: o[0], selected: (ui.grp || '') === o[0] }, o[1]); }));
+      sel.addEventListener('change', function () { ui.grp = sel.value; ui.cur = ''; render(); });
+      return h('span', { class: 'grp-bar' }, sel, h('button', { type: 'button', class: 'btn btn-sm', onclick: function () {
+        var v = prompt('이 검사표 파일의 구분(고객사 등)을 적어 주세요. 비우면 구분 없음.', f.group || ''); if (v === null) return;
+        v = v.trim().slice(0, 40); if (v) f.group = v; else delete f.group; save(); render();
+      } }, f.group ? '구분: ' + f.group + ' (바꾸기)' : '이 파일 구분 정하기'));
+    }
     var sk = L.sheetKey(f.id, ui.page);
     return [
       pageHead('②', '판독 — 검사표 보며 값 옮기기', '글자 층이 있는 검사표는 이미 읽어 두었고, 스캔 그림은 왼쪽을 보며 오른쪽 칸에 적습니다(호기 열 × 항목 줄). 적는 즉시 호기마다 합불이 나옵니다. 여러 쪽 PDF 는 쪽마다 따로 판독합니다.'),
       ui.busy ? h('p', { class: 'alert info' }, ui.busy) : null,
-      h('div', { class: 'read-bar' }, filt),
+      h('div', { class: 'read-bar' }, filt, grpBar()),
       h('div', { class: 'read-bar' },
         h('button', { type: 'button', class: 'btn', onclick: function () { go(-1); } }, '이전'),
         fileSel,
@@ -1207,8 +1252,17 @@
     var b = document.getElementById('sampleBanner');
     b.hidden = !db.sample;
     b.textContent = '지금 보시는 것은 가상 샘플입니다(가짜 모델 MODEL-A100 · B200, 품번 QA-…, 검사표 PDF 7개 — 글자 층 4 · 스캔 그림 2 · 합본 1(1쪽 자주 검사 + 2쪽 시트, 2쪽은 누운 스캔), 기준일 ' + (db.refDate || '') + '). 실제 자료를 넣기 전에 설정의 「모든 자료 지우기」를 해 주세요.';
+    var keepY = window.scrollY, rf0 = main.querySelector('.read-form'), vw0 = main.querySelector('.viewer');
+    var keep = { form: rf0 ? rf0.scrollTop : 0, vt: vw0 ? vw0.scrollTop : 0, vl: vw0 ? vw0.scrollLeft : 0, id: p.id };
     main.innerHTML = '';
     add(main, p.fn());
+    // 단추를 누를 때마다 화면이 맨 위로 올라가지 않게(11-11 요청) — 같은 화면을 다시 그릴 때만. 화면을 옮길 때는 hashchange 가 맨 위로 올림
+    if (render._last === p.id) {
+      var rf1 = main.querySelector('.read-form'), vw1 = main.querySelector('.viewer');
+      if (rf1) rf1.scrollTop = keep.form; if (vw1) { vw1.scrollTop = keep.vt; vw1.scrollLeft = keep.vl; }
+      window.scrollTo(0, keepY);
+    }
+    render._last = p.id;
     document.title = p.t + ' — 불량 제품 파악';
     save();
   }

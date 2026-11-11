@@ -416,3 +416,14 @@ table.list.sheet-grid td.lab select.spec-pick { display: block; margin-top: 4px;
 .model-pick select, .mask-help .form-grid select { max-width: 100%; }
 .card table.list td select { max-width: 230px; }
 .mask-help .form-grid { gap: 8px 14px; }
+
+/* 11-11 요청: 판독 — 검사표 그림과 값 옮기는 칸이 따로 움직인다(값 칸은 고정된 상자 안에서 굴림) */
+@media (min-width: 1100px) {
+  .read-grid { grid-template-columns: minmax(0, 1fr) minmax(380px, 40%); }
+  .read-grid > :first-child { position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow-y: auto; overscroll-behavior: contain; }
+  .read-form { position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; }
+}
+@media (min-width: 1360px) { .read-grid { grid-template-columns: minmax(0, 1fr) 520px; } }
+.grp-bar { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
+.read-bar .grp-sel { flex: 0 1 220px; }
+.grp-in { min-height: 44px; border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; font: inherit; max-width: 220px; }

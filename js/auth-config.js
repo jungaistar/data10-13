@@ -219,7 +219,8 @@ window.AUTH_CONFIG = {
           "image": "images/slide-4.jpg",
           "tone": "dark"
         }
-      ]
+      ],
+      "seoCompany": false
     }
   }
 };
